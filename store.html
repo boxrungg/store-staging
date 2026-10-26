@@ -1,0 +1,182 @@
+<!doctype html>
+<meta charset="utf-8">
+<title>BRS ready</title>
+<script>
+// BoxRun store: BoxRun's in-map menu opens this page in Deadlock's built-in browser (a hidden HTML panel) to keep
+// your routes, best times and settings between game sessions. Everything stays in this page's local storage on your
+// PC; requests arrive in the URL's #fragment, which browsers never send to a server, and answers go back through the
+// page title, which the game reads (spike-map/boxrun/README.md, map note MN-322).
+//
+// DRAFT v2 (boxrun-api/client/store.html; the live page is spike-map/boxrun/web/store.html): everything above still
+// works the same, and the page can also reach BoxRun's online codes at api.boxrun.gg when the game asks it to
+// (docs/BOXRUN-SHORT-CODES-PROTOCOL.md). Only then does it contact a server: to publish a route, look up a short
+// code, fetch a ghost or send a report. Edit keys for routes you publish stay in this page's storage.
+//
+// Request: #<seq>:<op> with op one of (values URL-encoded):
+//   put:<key>:<value>   app:<key>:<value> (append)   del:<key>   dump:<k>   ping
+//   ver   get:<key>:<k>   (v2)
+//   net:<job>:<what>   stage:<job>:<k>:<piece>   job:<job>:<k>   drop:<job>   (v2, online codes)
+// Keys: r:<name> a route code, b:<name> its best time, p:<key> a setting; (v2) g:<name> a ghost,
+//   k:<code> the edit key of a route you published.
+// Answer: title "BRS <seq> <reply>"; dump replies "d <k>/<n> <text>", the dump being
+//   "R <name> <best or -> <route code>" and "P <key> <value>" entries joined by " ~~ ", in pieces of 3800 characters
+//   (titles reach the game cut at 4096). get and job answer in the same pieces.
+var KEY = /^[rbpgk]:[a-z0-9_]{1,40}$/, PIECE = 3800;
+var API = "https://jb7sar7xfh.execute-api.us-east-1.amazonaws.com/v1";
+var JOB = /^[a-z0-9]{1,16}$/, MAX_JOBS = 8, STAGE_MAX = 460000, TRIES = 3, TIMEOUT = 20000;
+var jobs = {}, order = [];
+function dump() {
+	var out = [];
+	for (var i = 0; i < localStorage.length; i++) {
+		var k = localStorage.key(i);
+		if (/^r:/.test(k)) {
+			var name = k.slice(2), best = localStorage.getItem("b:" + name);
+			out.push("R " + name + " " + (best || "-") + " " + localStorage.getItem(k));
+		} else if (/^p:/.test(k)) {
+			out.push("P " + k.slice(2) + " " + localStorage.getItem(k));
+		}
+	}
+	return out.sort().join(" ~~ ");
+}
+function pieces(text, k) {
+	var n = Math.max(1, Math.ceil(text.length / PIECE));
+	return "d " + k + "/" + n + " " + text.substr(k * PIECE, PIECE);
+}
+function answer(op) {
+	var f = op.split(":"), what = f[0];
+	if (what === "ping") return "pong";
+	if (what === "ver") return "v2";
+	if (what === "dump") return pieces(dump(), parseInt(f[1], 10) || 0);
+	if (what === "net" || what === "stage" || what === "job" || what === "drop") return online(f);
+	var key = f[1] + ":" + f[2];
+	if (!KEY.test(key)) return "bad key";
+	if (what === "get") {
+		var v = localStorage.getItem(key);
+		return v === null ? "none" : pieces(v, parseInt(f[3], 10) || 0);
+	}
+	var value = f.slice(3).join(":");
+	if (what === "put") localStorage.setItem(key, value);
+	else if (what === "app") localStorage.setItem(key, (localStorage.getItem(key) || "") + value);
+	else if (what === "del") localStorage.removeItem(key);
+	else return "bad op";
+	return "ok";
+}
+
+// ------------------------------------------------------------------------------------------- online codes (v2)
+// A job is one request to the API, named by the game (<job>), so asking again after a lost answer finds the same job
+// instead of sending the request twice. Uploads are staged in pieces first; results are read back in pieces.
+//   net:<job>:fetch:<code>   net:<job>:ghost:<code>   net:<job>:pub   net:<job>:upd:<code>
+//   net:<job>:report:<code>:<reason>
+// Codes are BR-XXXXXX or BR-XXXXXX.<version>. pub and upd send the staged text, a JSON body {"route", "ghost"?}.
+// Job answers: "w" (working), "e <error> <message>", or the result in pieces "d <k>/<n> <text>":
+//   fetch  "R <code>.<version> <latest> <sum> <BR1 code>", then " ~~ G <hero> <souls> <time> <chars> <runner>"
+//          when that version has a ghost
+//   ghost  "G <code>.<version> <hero> <souls> <time> <runner> <BOTREC code>"
+//   pub, upd  "P <code> <version> <sum>" (pub keeps the new edit key as k:<code>)
+//   report "K"
+// Runner names have "_" for spaces and "-" when empty (the route text whitelist has neither "_" nor "~").
+function online(f) {
+	var what = f[0], id = f[1];
+	if (!JOB.test(id || "")) return "bad job";
+	var j = jobs[id];
+	if (what === "drop") { delete jobs[id]; return "ok"; }
+	if (what === "stage") {
+		var k = parseInt(f[2], 10), text = f.slice(3).join(":");
+		if (!j) j = newJob(id);
+		if (j.state !== "staging") return "e bad_request the job has started";
+		if (k === j.staged.length && j.size + text.length <= STAGE_MAX) { j.staged.push(text); j.size += text.length; }
+		else if (k === j.staged.length) return "e too_large the upload is too long";
+		return "s " + j.staged.length;
+	}
+	if (what === "job") {
+		if (!j) return "e no_job the page has no such job (it may have reloaded): start it again";
+		if (j.state === "done") return pieces(j.result, parseInt(f[2], 10) || 0);
+		if (j.state === "error") return "e " + j.error;
+		return "w";
+	}
+	// net
+	if (j && j.state !== "staging") return j.state === "error" ? "e " + j.error : "w";
+	if (!j) j = newJob(id);
+	j.state = "working";
+	try { start(j, f[2], f.slice(3)); } catch (e) { fail(j, "bad_request " + e.message); }
+	return j.state === "error" ? "e " + j.error : "w";
+}
+function newJob(id) {
+	var j = jobs[id] = { id: id, state: "staging", staged: [], size: 0, result: "", error: "",
+		idem: id + "-" + Math.random().toString(36).slice(2, 12) };
+	order.push(id);
+	while (order.length > MAX_JOBS) delete jobs[order.shift()];
+	return j;
+}
+function fail(j, error) { j.state = "error"; j.error = error; }
+function done(j, text) { j.state = "done"; j.result = text; j.staged = []; }
+function code6(code) { return String(code).toUpperCase().replace(/^BR-?/, "").split(".")[0]; }
+function codeOk(code) { return /^(BR-?)?[0-9A-Z]{6}(\.[0-9]{1,4})?$/i.test(code); }
+function under(s) { return s ? String(s).replace(/ /g, "_") : "-"; }
+function start(j, verb, args) {
+	var code = args[0] || "";
+	if (verb !== "pub" && !codeOk(code)) return fail(j, "bad_code not a BoxRun short code");
+	var path = "/routes/" + encodeURIComponent(code);
+	if (verb === "fetch") return call(j, "GET", path, null, null, function (b) {
+		var t = "R " + b.code + "." + b.version + " " + b.latest + " " + b.sum + " " + b.br1;
+		if (b.ghost) t += " ~~ G " + b.ghost.hero + " " + b.ghost.souls + " " + b.ghost.time + " " + b.ghost.chars + " " + under(b.ghost.runner);
+		return t;
+	});
+	if (verb === "ghost") return call(j, "GET", path + "/ghost", null, null, function (b) {
+		return "G " + b.code + "." + b.version + " " + b.hero + " " + b.souls + " " + b.time + " " + under(b.runner) + " " + b.botrec;
+	});
+	if (verb === "report") return call(j, "POST", path + "/report", JSON.stringify({ reason: args[1] || "other" }), null,
+		function () { return "K"; });
+	var body = j.staged.join("");
+	if (!body) return fail(j, "bad_request nothing was staged");
+	if (verb === "pub") return call(j, "POST", "/routes", body, null, function (b) {
+		if (!/^BR-[0-9A-Z]{6}$/.test(b.code) || !/^BRK-[0-9A-Z]{26}$/.test(b.edit_key)) throw new Error("odd answer");
+		localStorage.setItem("k:" + code6(b.code).toLowerCase(), b.edit_key);   // kept before the game hears of it
+		return "P " + b.code + " " + b.version + " " + b.sum;
+	});
+	if (verb === "upd") {
+		var key = localStorage.getItem("k:" + code6(code).toLowerCase());
+		if (!key) return fail(j, "no_key this PC has no edit key for " + code);
+		return call(j, "POST", path + "/versions", body, key, function (b) { return "P " + b.code + " " + b.version + " " + b.sum; });
+	}
+	fail(j, "bad_request unknown request " + verb);
+}
+// One API call with retries: the network failing, a timeout, a 5xx, a 409 (busy) or the whole-API throttle is tried again, up to
+// TRIES times; anything else is the answer. pub and upd send an Idempotency-Key, so a retry can't publish twice.
+function call(j, method, path, body, key, ok, tries) {
+	tries = (tries || 0) + 1;
+	var headers = {}, ctl = typeof AbortController === "function" ? new AbortController() : null;
+	if (body !== null) headers["content-type"] = "application/json";
+	if (key) headers["authorization"] = "Bearer " + key;
+	if (method === "POST" && !/report$/.test(path)) headers["idempotency-key"] = j.idem;
+	var timer = setTimeout(function () { if (ctl) ctl.abort(); }, TIMEOUT);
+	function again(error) {
+		if (tries < TRIES) setTimeout(function () { call(j, method, path, body, key, ok, tries); }, 1000 * tries * tries);
+		else fail(j, error);
+	}
+	fetch(API + path, { method: method, headers: headers, body: body === null ? undefined : body,
+		signal: ctl ? ctl.signal : undefined, credentials: "omit" })
+		.then(function (r) {
+			clearTimeout(timer);
+			return r.text().then(function (t) {
+				var b = null;
+				try { b = JSON.parse(t); } catch (e) { b = null; }
+				// a 429 without our error code is API Gateway's whole-API throttle (a launch-day rush): wait and retry
+				if (r.status >= 500 || r.status === 409 || (r.status === 429 && !(b && b.error))) return again((b && b.error || "server") + " " + (b && b.message || "the server had a problem"));
+				if (!r.ok || !b) return fail(j, (b && b.error || "server") + " " + (b && b.message || "odd answer from the server") +
+					(r.status === 429 ? " (" + (r.headers.get("retry-after") || "60") + " s)" : ""));
+				try { done(j, ok(b)); } catch (e) { fail(j, "server odd answer from the server"); }
+			});
+		}, function () { clearTimeout(timer); again("offline the online library can't be reached"); });
+}
+
+function handle() {
+	var h = location.hash.slice(1), at = h.indexOf(":");
+	if (at < 0) return;
+	var seq = h.slice(0, at), reply;
+	try { reply = answer(decodeURIComponent(h.slice(at + 1))); } catch (e) { reply = "err " + e; }
+	document.title = "BRS " + seq + " " + reply;
+}
+window.addEventListener("hashchange", handle);
+handle();
+</script>
