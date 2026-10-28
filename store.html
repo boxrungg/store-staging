@@ -22,7 +22,7 @@
 //   "R <name> <best or -> <route code>" and "P <key> <value>" entries joined by " ~~ ", in pieces of 3800 characters
 //   (titles reach the game cut at 4096). get and job answer in the same pieces.
 var KEY = /^[rbpgk]:[a-z0-9_]{1,40}$/, PIECE = 3800;
-var API = "https://jb7sar7xfh.execute-api.us-east-1.amazonaws.com/v1";
+var API = "https://api.boxrun.gg/v1";
 var JOB = /^[a-z0-9]{1,16}$/, MAX_JOBS = 8, STAGE_MAX = 460000, TRIES = 3, TIMEOUT = 20000;
 var jobs = {}, order = [];
 function dump() {
@@ -71,7 +71,7 @@ function answer(op) {
 // Job answers: "w" (working), "e <error> <message>", or the result in pieces "d <k>/<n> <text>":
 //   fetch  "R <code>.<version> <latest> <sum> <BR1 code>", then " ~~ G <hero> <souls> <time> <chars> <runner>"
 //          when that version has a ghost
-//   ghost  "G <code>.<version> <hero> <souls> <time> <runner> <BOTREC code>"
+//   ghost  "G <code>.<version> <hero> <souls> <time> <runner> <path step ms or 0> <spot> <BOTREC code>[ <BRGP1 path>]"
 //   pub, upd  "P <code> <version> <sum>" (pub keeps the new edit key as k:<code>)
 //   report "K"
 // Runner names have "_" for spaces and "-" when empty (the route text whitelist has neither "_" nor "~").
@@ -115,6 +115,11 @@ function codeOk(code) { return /^(BR-?)?[0-9A-Z]{6}(\.[0-9]{1,4})?$/i.test(code)
 function under(s) { return s ? String(s).replace(/ /g, "_") : "-"; }
 function start(j, verb, args) {
 	var code = args[0] || "";
+	// the game's own idempotency key, one per route and what's sent (net:<job>:pub:<key>, net:<job>:upd:<code>:<key>):
+	// a publish asked again in a later job (its answer came after the game gave up) gets the first answer back, the
+	// same code and edit key, never a second route. Without one (older games) the job's own key is used.
+	var idem = verb === "pub" ? args[0] : verb === "upd" ? args[1] : "";
+	if (idem && /^[a-z0-9-]{8,64}$/.test(idem)) j.idem = idem;       // the API takes 8-64 characters
 	if (verb !== "pub" && !codeOk(code)) return fail(j, "bad_code not a BoxRun short code");
 	var path = "/routes/" + encodeURIComponent(code);
 	if (verb === "fetch") return call(j, "GET", path, null, null, function (b) {
@@ -123,7 +128,9 @@ function start(j, verb, args) {
 		return t;
 	});
 	if (verb === "ghost") return call(j, "GET", path + "/ghost", null, null, function (b) {
-		return "G " + b.code + "." + b.version + " " + b.hero + " " + b.souls + " " + b.time + " " + under(b.runner) + " " + b.botrec;
+		if (b.path && !/^BRGP1\.[A-Za-z0-9._]+=*$/.test(b.path)) throw new Error("odd path");
+		return "G " + b.code + "." + b.version + " " + b.hero + " " + b.souls + " " + b.time + " " + under(b.runner) + " " +
+			(b.step || 0) + " " + (b.spot || 0) + " " + b.botrec + (b.path ? " " + b.path : "");
 	});
 	if (verb === "report") return call(j, "POST", path + "/report", JSON.stringify({ reason: args[1] || "other" }), null,
 		function () { return "K"; });
