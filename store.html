@@ -14,6 +14,7 @@
 //
 // Request: #<seq>:<op> with op one of (values URL-encoded):
 //   put:<key>:<value>   app:<key>:<value> (append)   del:<key>   dump:<k>   ping
+//   pc:<key>:<k>:<value> (piece k of a value, idempotent; 1.6.6; "bad op" on an older page)
 //   ver   get:<key>:<k>   (v2)
 //   net:<job>:<what>   stage:<job>:<k>:<piece>   job:<job>:<k>   drop:<job>   (v2, online codes)
 // Keys: r:<name> a route code, b:<name> its best time, p:<key> a setting; (v2) g:<name> a ghost,
@@ -54,11 +55,27 @@ function answer(op) {
 		var v = localStorage.getItem(key);
 		return v === null ? "none" : pieces(v, parseInt(f[3], 10) || 0);
 	}
+	if (what === "pc") return piece(key, f[3], f.slice(4).join(":"));
 	var value = f.slice(3).join(":");
 	if (what === "put") localStorage.setItem(key, value);
 	else if (what === "app") localStorage.setItem(key, (localStorage.getItem(key) || "") + value);
-	else if (what === "del") localStorage.removeItem(key);
+	else if (what === "del") { localStorage.removeItem(key); localStorage.removeItem("c:" + key); }
 	else return "bad op";
+	return "ok";
+}
+// pc:<key>:<k>:<value>, piece k of a value sent in pieces (the timing audit's B9): asked again after a lost answer, app:
+// appended a piece twice and corrupted the saved route or ghost. Piece 0 starts the value over; piece k is appended only
+// when it's the next one (the count is kept under c:<key>), and one already in is answered "ok" again. The value is
+// stored as put: and app: store it, so older games read it.
+function piece(key, k, value) {
+	k = parseInt(k, 10);
+	if (!(k >= 0)) return "bad piece";
+	var have = parseInt(localStorage.getItem("c:" + key), 10) || 0;
+	if (k === 0) { localStorage.setItem(key, value); localStorage.setItem("c:" + key, "1"); return "ok"; }
+	if (k < have) return "ok";
+	if (k > have) return "gap " + have;
+	localStorage.setItem(key, (localStorage.getItem(key) || "") + value);
+	localStorage.setItem("c:" + key, String(k + 1));
 	return "ok";
 }
 
@@ -66,14 +83,18 @@ function answer(op) {
 // A job is one request to the API, named by the game (<job>), so asking again after a lost answer finds the same job
 // instead of sending the request twice. Uploads are staged in pieces first; results are read back in pieces.
 //   net:<job>:fetch:<code>   net:<job>:ghost:<code>   net:<job>:pub   net:<job>:upd:<code>
-//   net:<job>:report:<code>:<reason>
+//   net:<job>:report:<code>:<reason>   net:<job>:featured
 // Codes are BR-XXXXXX or BR-XXXXXX.<version>. pub and upd send the staged text, a JSON body {"route", "ghost"?}.
 // Job answers: "w" (working), "e <error> <message>", or the result in pieces "d <k>/<n> <text>":
 //   fetch  "R <code>.<version> <latest> <sum> <BR1 code>", then " ~~ G <hero> <souls> <time> <chars> <runner>"
-//          when that version has a ghost
+//          when that version has a ghost, then " ~~ N <players>" (distinct players who loaded the code, when the
+//          API sends it; older games read neither)
 //   ghost  "G <code>.<version> <hero> <souls> <time> <runner> <path step ms or 0> <spot> <BOTREC code>[ <BRGP1 path>]"
 //   pub, upd  "P <code> <version> <sum>" (pub keeps the new edit key as k:<code>)
 //   report "K"
+//   featured  "F <code>.<version> <name with _ for spaces>" (the week's featured route) or "F -" when none, then
+//          " ~~ V <latest BoxRun version>", " ~~ M <notice with _ for spaces>" and " ~~ O" (codes switched off), each
+//          only when set
 // Runner names have "_" for spaces and "-" when empty (the route text whitelist has neither "_" nor "~").
 function online(f) {
 	var what = f[0], id = f[1];
@@ -115,6 +136,17 @@ function codeOk(code) { return /^(BR-?)?[0-9A-Z]{6}(\.[0-9]{1,4})?$/i.test(code)
 function under(s) { return s ? String(s).replace(/ /g, "_") : "-"; }
 function start(j, verb, args) {
 	var code = args[0] || "";
+	if (verb === "featured") return call(j, "GET", "/featured", null, null, function (b) {
+		var t = "F -";
+		if (b.code) {
+			if (!/^BR-[0-9A-Z]{6}$/.test(b.code) || !(b.version > 0)) throw new Error("odd answer");
+			t = "F " + b.code + "." + b.version + " " + under(b.name);
+		}
+		if (b.latest && /^\d{1,3}(\.\d{1,3}){0,2}$/.test(b.latest)) t += " ~~ V " + b.latest;
+		if (b.notice) t += " ~~ M " + under(String(b.notice).replace(/~/g, ""));
+		if (b.codes === "off") t += " ~~ O";
+		return t;
+	});
 	// the game's own idempotency key, one per route and what's sent (net:<job>:pub:<key>, net:<job>:upd:<code>:<key>):
 	// a publish asked again in a later job (its answer came after the game gave up) gets the first answer back, the
 	// same code and edit key, never a second route. Without one (older games) the job's own key is used.
@@ -125,6 +157,7 @@ function start(j, verb, args) {
 	if (verb === "fetch") return call(j, "GET", path, null, null, function (b) {
 		var t = "R " + b.code + "." + b.version + " " + b.latest + " " + b.sum + " " + b.br1;
 		if (b.ghost) t += " ~~ G " + b.ghost.hero + " " + b.ghost.souls + " " + b.ghost.time + " " + b.ghost.chars + " " + under(b.ghost.runner);
+		if (typeof b.players === "number") t += " ~~ N " + b.players;
 		return t;
 	});
 	if (verb === "ghost") return call(j, "GET", path + "/ghost", null, null, function (b) {
