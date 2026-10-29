@@ -1,0 +1,30 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="robots" content="noindex">
+<title>BRRESET</title>
+<style>body{margin:0;background:#1b1c2c;color:#ecebf5;font:16px/1.5 system-ui,sans-serif;padding:2rem}</style>
+</head>
+<body>
+<p id="out">Clearing...</p>
+<p>Test only: empties this origin's storage (boxrungg.github.io), so the staging store page starts as a new player's. Players' saves live on save.boxrun.gg, a different origin this page can't reach.</p>
+<script>
+// Runs on load, so a test client's browser panel only has to open it. The title carries the result for scripts:
+// "BRRESET cleared N" or "BRRESET failed <reason>".
+(function () {
+  var out = document.getElementById("out"), n;
+  try {
+    n = localStorage.length;
+    localStorage.clear();
+    try { sessionStorage.clear(); } catch (e) {}
+    out.textContent = "Cleared " + n + " keys. " + localStorage.length + " left.";
+    document.title = "BRRESET cleared " + n;
+  } catch (e) {
+    out.textContent = "Couldn't clear: " + e;
+    document.title = "BRRESET failed " + (e && e.name || e);
+  }
+})();
+</script>
+</body>
+</html>
