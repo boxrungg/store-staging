@@ -21,7 +21,7 @@
 	};
 	Object.defineProperty(ns, "length", { get: function () { return keys().length; } });
 	var html = get(cfg.page === "old" ? "old.html" : "new.html");
-	var js = html.slice(html.indexOf("<script>") + 8, html.lastIndexOf("</script>"));
+	var js = html.slice(html.indexOf("<script>") + 8, html.lastIndexOf("<\/script>"));
 	if (js.indexOf('var API = "https://api.boxrun.gg/v1";') < 0) throw new Error("no API line");
 	js = js.replace('var API = "https://api.boxrun.gg/v1";', "var API = " + JSON.stringify(cfg.api) + ";");
 	window.BRHUNT = cfg;
