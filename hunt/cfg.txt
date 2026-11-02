@@ -1,1 +1,1 @@
-ns=s21a page=new api=https://hpifrt2kj1.execute-api.us-east-1.amazonaws.com/v1
+ns=dep206 page=new api=https://api.boxrun.gg/v1
