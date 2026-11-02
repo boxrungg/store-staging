@@ -1,1 +1,1 @@
-ns=hunt1 page=new api=https://hpifrt2kj1.execute-api.us-east-1.amazonaws.com/v1
+ns=up1 page=old api=https://hpifrt2kj1.execute-api.us-east-1.amazonaws.com/v1
