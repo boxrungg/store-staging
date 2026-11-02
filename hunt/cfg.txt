@@ -1,1 +1,1 @@
-ns=dep206 page=new api=https://api.boxrun.gg/v1
+ns=dep21 page=new api=https://api.boxrun.gg/v1
