@@ -1,1 +1,1 @@
-ns=on1 page=new api=https://hpifrt2kj1.execute-api.us-east-1.amazonaws.com/dead
+ns=dead1 page=new api=https://hpifrt2kj1.execute-api.us-east-1.amazonaws.com/dead
