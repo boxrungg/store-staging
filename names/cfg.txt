@@ -1,1 +1,1 @@
-ns=nm_ls1 page=new api=https://hpifrt2kj1.execute-api.us-east-1.amazonaws.com/v1 seed=roof.json
+ns=nm_ot1 page=new api=https://hpifrt2kj1.execute-api.us-east-1.amazonaws.com/v1 seed=fresh.json
