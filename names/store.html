@@ -1,0 +1,38 @@
+<!doctype html>
+<meta charset="utf-8">
+<title>BRS ready</title>
+<script>
+// TEST ONLY (BoxRun 2.1 bug hunt, 2026-11-02): a loader for BoxRun's save page on the staging origin. It reads cfg.txt
+// (ns=<store name> page=<new|old> api=<API base>), fetches that page (new.html: api/client/store.html, the 2.1 page;
+// old.html: the live save.boxrun.gg page) and runs its script unchanged except for its API line, with localStorage
+// seen under the prefix "<ns>|", so one test build can meet the new or the old page, the staging API or a dead one,
+// and a fresh or kept store, by changing cfg.txt. Never on save.boxrun.gg.
+(function () {
+	function get(u) { var x = new XMLHttpRequest(); x.open("GET", u + "?t=" + Date.now(), false); x.send(); if (x.status !== 200) throw new Error(u + " " + x.status); return x.responseText; }
+	var cfg = {};
+	get("cfg.txt").trim().split(/\s+/).forEach(function (w) { var i = w.indexOf("="); cfg[w.slice(0, i)] = w.slice(i + 1); });
+	var L = window.localStorage, p = (cfg.ns || "hunt1") + "|";
+	function keys() { var o = []; for (var i = 0; i < L.length; i++) { var k = L.key(i); if (k.indexOf(p) === 0) o.push(k.slice(p.length)); } return o; }
+	var ns = {
+		key: function (i) { var k = keys()[i]; return k === undefined ? null : k; },
+		getItem: function (k) { return L.getItem(p + k); },
+		setItem: function (k, v) { L.setItem(p + k, String(v)); },
+		removeItem: function (k) { L.removeItem(p + k); },
+	};
+	Object.defineProperty(ns, "length", { get: function () { return keys().length; } });
+	// names/ only (BoxRun 2.1.x names-and-shelf check, 2026-11-02): seed=<file.json> writes that store once into this
+	// ns before the page runs ({"r:<name>": route text, "b:<name>": best, "p:<key>": setting}), so a store can start as
+	// an older build's player had it
+	if (cfg.seed && !L.getItem(p + "_seeded_" + cfg.seed)) {
+		var sd = JSON.parse(get(cfg.seed));
+		Object.keys(sd).forEach(function (k) { L.setItem(p + k, String(sd[k])); });
+		L.setItem(p + "_seeded_" + cfg.seed, "1");
+	}
+	var html = get(cfg.page === "old" ? "old.html" : "new.html");
+	var js = html.slice(html.indexOf("<script>") + 8, html.lastIndexOf("<\/script>"));
+	if (js.indexOf('var API = "https://api.boxrun.gg/v1";') < 0) throw new Error("no API line");
+	js = js.replace('var API = "https://api.boxrun.gg/v1";', "var API = " + JSON.stringify(cfg.api) + ";");
+	window.BRHUNT = cfg;
+	new Function("localStorage", js)(ns);
+})();
+</script>
