@@ -1,0 +1,1 @@
+ns=nm_up1 page=new api=https://hpifrt2kj1.execute-api.us-east-1.amazonaws.com/v1 seed=up206.json
