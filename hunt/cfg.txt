@@ -1,1 +1,1 @@
-ns=cnt1 page=new api=https://hpifrt2kj1.execute-api.us-east-1.amazonaws.com/v1
+ns=f5a page=new api=https://hpifrt2kj1.execute-api.us-east-1.amazonaws.com/v1
