@@ -98,11 +98,28 @@ function piece(key, k, value) {
 //   report "K"
 //   list   "T <code> <1 or 0>": the route listed in COMMUNITY (1) or code only (0), with the stored edit key
 //   featured  "F <code>.<version> <name with _ for spaces>" (the week's featured route) or "F -" when none, then
-//          " ~~ V <latest BoxRun version>", " ~~ M <notice with _ for spaces>" and " ~~ O" (codes switched off), each
-//          only when set; then, when the API has the COMMUNITY shelf, " ~~ L" and one " ~~ S <list> <code>.<version>
+//          " ~~ V <latest BoxRun version>", " ~~ M <notice with _ for spaces>", " ~~ O" (codes switched off) and
+//          " ~~ AG 0" (the puppet's animation graph switched off, admin.py ag off), each only when set; then, when the API has the COMMUNITY shelf, " ~~ L" and one " ~~ S <list> <code>.<version>
 //          <map> <kind or -> <checkpoints> <boxes> <urn 0/1> <hero or -> <gold/silver/bronze or -> <players> <name>
-//          <maker or ->" per route (list: pick, featured, popular, new; names with _ for spaces). featured:0 (counts off)
+//          <maker or ->" per route (list: pick, featured, popular, new; names with _ for spaces), each followed by
+//          " ~~ SP <code> <line>" when the API sends the route's line (shelf.py line(); older games skip it). featured:0 (counts off)
 //          asks /featured?count=0, which the server limits under its own name and the stats never read.
+//          Then, when the API has the weekly board (docs/BOXRUN-WEEKLY-BOARD.md 7.4), " ~~ W <week id> <code>.<version> <ends>
+//          <entries>" (" ~~ W -" when no week is on), " ~~ WF <place> <entry> <hero> <time> <name>" per fastest time,
+//          " ~~ WM <place> <entry> <runs> <name>" per most runs, and " ~~ WL <code> <route name> <fastest name> <time>
+//          <hero> <most name> <runs>" for last week's winners ("-" for one that's missing). Older games read none of them.
+//   The weekly board's own jobs (docs/BOXRUN-WEEKLY-BOARD.md 7.4). The entry key is kept as k:week = "BRW-...|<week id>"
+//   and sent only for its own week; the game never reads it.
+//   week:<week id>   (a week id is its first Pacific day, 2026-11-02, or 2026-11-02-2 for a second week opened that day)
+//          "Y <entry> <time> <runs> <place> <runs place> <of> <status> <name>" (places "-" while held) and
+//          the board's segments as featured has them; "Y -" with no entry. Without a key for that week it answers
+//          "Y -" from here, with no request. Then the entries just above and below yours, " ~~ YF <place> <entry> <hero>
+//          <time> <name>" and " ~~ YM <place> <entry> <runs> <name>" (the API's you.near); older games skip them.
+//   wsend:<idempotency key>:<week id>   the staged entry (POST /week/entry): "E <entry> <time> <runs> <best 1/0> <place>
+//          <runs place> <of> <week id>"; a new entry's key is kept as k:week before the game hears of it
+//   wdrop:<week id>   the entry and its ghost taken off (POST /week/withdraw): "K", and k:week goes
+//   wghost:<entry>   an entry's ghost, answered as ghost is (the code "-" for a week whose route isn't known)
+//   wrep:<entry>:<reason>   a report (time, ghost, name or other): "K"
 //   count  "K" once the server took it: one anonymous count, sent as text/plain with no cookies, key or other header,
 //          sent once, never tried again: the server adds every count it gets, so a second try after a lost answer
 //          could double it, and a lost one only undercounts. "e not_found" when the API has no /v1/count (a 404), so
@@ -159,13 +176,16 @@ function shelfText(sh) {
 			t += " ~~ S " + k + " " + c.code + "." + c.version + " " + c.map + " " + (c.kind === "open" || c.kind === "guided" ? c.kind : "-") +
 				" " + c.checkpoints + " " + c.boxes + " " + (c.urn ? 1 : 0) + " " + word(c.hero) + " " + ti + " " + c.players +
 				" " + word(c.name) + " " + word(c.maker);
+			// the route's line for its postcard (shelf.py line(): 6 base-36 characters a point, 2 to 24 points) in a segment
+			// of its own, which older games' shelf reading skips
+			if (typeof c.line === "string" && /^[0-9a-z]{12,144}$/.test(c.line) && c.line.length % 6 === 0) t += " ~~ SP " + c.code + " " + c.line;
 		});
 	});
 	return t;
 }
 // The anonymous counts (docs/BOXRUN-MEASUREMENT.md 5.4): the body is rebuilt from these fields alone, in this order, and
 // anything else the game put in is left out. Refused (the job fails) when a field is missing or out of range.
-var COUNT_STEPS = ["load", "menu", "start", "finish", "count", "make", "import"], COUNT_MIN = [0, 1, 2, 5, 10, 30, 60, 1440];
+var COUNT_STEPS = ["load", "menu", "seen", "shot", "press", "go", "ready", "start", "finish", "count", "make", "import", "community"], COUNT_MIN = [0, 1, 2, 5, 10, 30, 60, 1440];
 var COUNT_KINDS = ["sample", "pack", "community", "own"], COUNT_RUNS = ["start", "finish", "count"], COUNT_CODES = 20, COUNT_MAX = 512;
 function countBody(text) {
 	var d = JSON.parse(text), b = {};
@@ -214,8 +234,100 @@ function countCall(j, body) {
 			});
 		}, function () { clearTimeout(timer); fail(j, "offline the counts can't be sent"); });
 }
+// the weekly board as " ~~ W" segments (the featured answer and the week job); an odd row is left out, never the answer
+var WEEK_ID = /^\d{4}-\d\d-\d\d(-\d{1,3})?$/, ENTRY = /^[0-9a-f]{12}$/, HERO = /^hero_[a-z0-9_]{1,30}$/;
+function boardText(bd) {
+	if (!bd || typeof bd !== "object") return "";
+	var n = function (v, lo, hi) { return typeof v === "number" && v >= lo && v <= hi && Math.floor(v) === v; };
+	var time = function (v) { return typeof v === "number" && v > 0 && v < 10000 ? String(Math.round(v * 1000) / 1000) : ""; };
+	var word = function (v) { return v ? under(String(v).replace(/[~_\s]+/g, " ").trim()) : "-"; };
+	var t = "", w = bd.week, l = bd.last;
+	if (w && WEEK_ID.test(w.id) && /^BR-[0-9A-Z]{6}$/.test(w.code) && n(w.version, 1, 9999) && n(w.ends, 0, 9999999999) && n(w.entries, 0, 9999999)) {
+		t += " ~~ W " + w.id + " " + w.code + "." + w.version + " " + w.ends + " " + w.entries;
+		(Array.isArray(w.fastest) ? w.fastest : []).slice(0, 5).forEach(function (r) {
+			if (r && n(r.place, 1, 9) && ENTRY.test(r.entry) && HERO.test(r.hero) && time(r.time) && r.runner)
+				t += " ~~ WF " + r.place + " " + r.entry + " " + r.hero + " " + time(r.time) + " " + word(r.runner);
+		});
+		(Array.isArray(w.most) ? w.most : []).slice(0, 3).forEach(function (r) {
+			if (r && n(r.place, 1, 9) && ENTRY.test(r.entry) && n(r.runs, 1, 99999) && r.runner)
+				t += " ~~ WM " + r.place + " " + r.entry + " " + r.runs + " " + word(r.runner);
+		});
+	} else t += " ~~ W -";
+	if (l && /^BR-[0-9A-Z]{6}$/.test(l.code)) {
+		var f = l.fastest && time(l.fastest.time) && HERO.test(l.fastest.hero) ? l.fastest : null, m = l.most && n(l.most.runs, 1, 99999) ? l.most : null;
+		t += " ~~ WL " + l.code + " " + word(l.name) + " " + (f ? word(f.runner) + " " + time(f.time) + " " + f.hero : "- - -") +
+			" " + (m ? word(m.runner) + " " + m.runs : "- -");
+		// last week's fastest entry while it's kept, for the game's WATCH (its own segment: older brains skip it)
+		if (f && ENTRY.test(f.entry || "")) t += " ~~ WLE " + f.entry;
+	}
+	return t;
+}
+// the entries just above and below yours on each list (GET /week with the key; #4 too when you're #6), as " ~~ YF" and " ~~ YM" segments with
+// WF's and WM's checks: an odd row is left out, never the answer. Older brains skip segments they don't know.
+function nearText(nr) {
+	if (!nr || typeof nr !== "object") return "";
+	var n = function (v, lo, hi) { return typeof v === "number" && v >= lo && v <= hi && Math.floor(v) === v; };
+	var time = function (v) { return typeof v === "number" && v > 0 && v < 10000 ? String(Math.round(v * 1000) / 1000) : ""; };
+	var word = function (v) { return v ? under(String(v).replace(/[~_\s]+/g, " ").trim()) : "-"; };
+	var t = "";
+	(Array.isArray(nr.fastest) ? nr.fastest : []).slice(0, 3).forEach(function (r) {
+		if (r && n(r.place, 1, 9999999) && ENTRY.test(r.entry) && HERO.test(r.hero) && time(r.time) && r.runner)
+			t += " ~~ YF " + r.place + " " + r.entry + " " + r.hero + " " + time(r.time) + " " + word(r.runner);
+	});
+	(Array.isArray(nr.most) ? nr.most : []).slice(0, 3).forEach(function (r) {
+		if (r && n(r.place, 1, 9999999) && ENTRY.test(r.entry) && n(r.runs, 1, 99999) && r.runner)
+			t += " ~~ YM " + r.place + " " + r.entry + " " + r.runs + " " + word(r.runner);
+	});
+	return t;
+}
+function weekKey(wid) {
+	var v = String(localStorage.getItem("k:week") || "").split("|");
+	return /^BRW-[0-9A-Z]{26}$/.test(v[0]) && v[1] === wid ? v[0] : "";
+}
+function place(v) { return typeof v === "number" && v > 0 ? String(v) : "-"; }
+function weekJob(j, verb, args) {
+	var wid = args[verb === "wsend" ? 1 : 0] || "";
+	if (verb === "wghost" || verb === "wrep") {
+		if (!ENTRY.test(wid)) return fail(j, "bad_request not a board entry");
+		if (verb === "wrep") return call(j, "POST", "/week/entries/" + wid + "/report", JSON.stringify({ reason: args[1] || "other" }), null,
+			function () { return "K"; });
+		return call(j, "GET", "/week/entries/" + wid + "/ghost", null, null, function (b) {
+			if (b.path && !/^BRGP1\.[A-Za-z0-9._]+=*$/.test(b.path)) throw new Error("odd path");
+			return "G " + (b.code || "-") + "." + b.version + " " + b.hero + " " + b.souls + " " + b.time + " " + under(b.runner) + " " +
+				(b.step || 0) + " " + (b.spot || 0) + " " + b.botrec + (b.path ? " " + b.path : "");
+		});
+	}
+	if (!WEEK_ID.test(wid)) return fail(j, "bad_request not a week");
+	var key = weekKey(wid);
+	if (verb === "week") {
+		if (!key) return done(j, "Y -");
+		return call(j, "GET", "/week", null, key, function (b) {
+			var y = b.you;
+			if (y && !ENTRY.test(y.entry)) throw new Error("odd answer");
+			return (y ? "Y " + y.entry + " " + y.time + " " + y.runs + " " + place(y.place) + " " + place(y.runs_place) + " " + (y.of || 0) + " " +
+				(y.status === "ok" ? "ok" : "held") + " " + under(y.runner) : "Y -") + boardText(b) + nearText(y && y.near);
+		});
+	}
+	if (verb === "wdrop") {
+		if (!key) return fail(j, "not_found You have no time on this week's board.");
+		return call(j, "POST", "/week/withdraw", null, key, function () { localStorage.removeItem("k:week"); return "K"; });
+	}
+	if (verb !== "wsend") return fail(j, "bad_request unknown request " + verb);
+	var body = j.staged.join("");
+	if (!body) return fail(j, "bad_request nothing was staged");
+	return call(j, "POST", "/week/entry", body, key || null, function (b) {
+		if (!ENTRY.test(b.entry) || !WEEK_ID.test(b.week) || (b.key && !/^BRW-[0-9A-Z]{26}$/.test(b.key))) throw new Error("odd answer");
+		if (b.key) localStorage.setItem("k:week", b.key + "|" + b.week);       // kept before the game hears of it
+		return "E " + b.entry + " " + b.time + " " + b.runs + " " + (b.best ? 1 : 0) + " " + place(b.place) + " " + place(b.runs_place) +
+			" " + (b.of || 0) + " " + b.week;
+	});
+}
 function start(j, verb, args) {
 	var code = args[0] || "";
+	if (/^(week|wsend|wdrop|wghost|wrep)$/.test(verb)) {
+		if (verb === "wsend" && /^[a-z0-9-]{8,64}$/.test(args[0] || "")) j.idem = args[0];
+		return weekJob(j, verb, args);
+	}
 	if (verb === "count") {
 		var body;
 		try { body = countBody(args.join(":")); } catch (e) { return fail(j, "bad_request " + e.message); }
@@ -230,7 +342,9 @@ function start(j, verb, args) {
 		if (b.latest && /^\d{1,3}(\.\d{1,3}){0,2}$/.test(b.latest)) t += " ~~ V " + b.latest;
 		if (b.notice) t += " ~~ M " + under(String(b.notice).replace(/~/g, ""));
 		if (b.codes === "off") t += " ~~ O";
+		if (b.ag === "off") t += " ~~ AG 0";
 		if (b.shelf) t += " ~~ L" + shelfText(b.shelf);
+		if (b.board) t += boardText(b.board);
 		return t;
 	});
 	// the game's own idempotency key, one per route and what's sent (net:<job>:pub:<key>, net:<job>:upd:<code>:<key>):
@@ -298,7 +412,9 @@ function call(j, method, path, body, key, ok, tries) {
 				var b = null;
 				try { b = JSON.parse(t); } catch (e) { b = null; }
 				// a 429 without our error code is API Gateway's whole-API throttle (a launch-day rush): wait and retry
-				if (r.status >= 500 || r.status === 409 || (r.status === 429 && !(b && b.error))) return again((b && b.error || "server") + " " + (b && b.message || "the server had a problem"));
+				// (the weekly board's 409s are answers: no week on, or another route's week)
+				var busy = r.status === 409 && !(b && /^(no_week|not_this_week)$/.test(b.error));
+				if (r.status >= 500 || busy || (r.status === 429 && !(b && b.error))) return again((b && b.error || "server") + " " + (b && b.message || "the server had a problem"));
 				if (!r.ok || !b) return fail(j, (b && b.error || "server") + " " + (b && b.message || "odd answer from the server") +
 					(r.status === 429 ? " (" + (r.headers.get("retry-after") || "60") + " s)" : ""));
 				try { done(j, ok(b)); } catch (e) { fail(j, "server odd answer from the server"); }
