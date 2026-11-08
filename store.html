@@ -163,12 +163,14 @@ function done(j, text) { j.state = "done"; j.result = text; j.staged = []; }
 function code6(code) { return String(code).toUpperCase().replace(/^BR-?/, "").split(".")[0]; }
 function codeOk(code) { return /^(BR-?)?[0-9A-Z]{6}(\.[0-9]{1,4})?$/i.test(code); }
 function under(s) { return s ? String(s).replace(/ /g, "_") : "-"; }
-// the COMMUNITY shelf's routes as " ~~ S ..." segments; an odd item is left out, never the answer
+// the COMMUNITY shelf's routes as " ~~ S ..." segments; an odd item is left out, never the answer. Up to SHELF_MAX a
+// list (shelf.py LIST_MAX, 40 since 11-08; was 12): at every card's longest about 28.5 KB, 8 title pieces
+var SHELF_MAX = 40;
 function shelfText(sh) {
 	var t = "", n = function (v, max) { return typeof v === "number" && v >= 0 && v <= max && Math.floor(v) === v; };
 	var word = function (v) { return v ? under(String(v).replace(/[~_\s]+/g, " ").trim()) : "-"; };
 	["pick", "featured", "popular", "new"].forEach(function (k) {
-		(Array.isArray(sh[k]) ? sh[k] : []).slice(0, 12).forEach(function (c) {
+		(Array.isArray(sh[k]) ? sh[k] : []).slice(0, SHELF_MAX).forEach(function (c) {
 			if (!c || !/^BR-[0-9A-Z]{6}$/.test(c.code) || !(c.version > 0) || !/^[a-z0-9_]{1,40}$/.test(c.map || "") ||
 				!n(c.checkpoints, 999) || !n(c.boxes, 9999) || !n(c.players, 9999999) || !c.name) return;
 			var ti = c.tiers && [c.tiers.gold, c.tiers.silver, c.tiers.bronze].every(function (x) { return typeof x === "number" && x > 0; }) ?
