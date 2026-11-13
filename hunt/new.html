@@ -105,11 +105,15 @@ function piece(key, k, value) {
 //          " ~~ SP <code> <line>" when the API sends the route's line (shelf.py line(); older games skip it). featured:0 (counts off)
 //          asks /featured?count=0, which the server limits under its own name and the stats never read.
 //          Then, when the API has the weekly board (docs/BOXRUN-WEEKLY-BOARD.md 7.4), " ~~ W <week id> <code>.<version> <ends>
-//          <entries>" (" ~~ W -" when no week is on), " ~~ WF <place> <entry> <hero> <time> <name>" per fastest time,
+//          <entries>" (" ~~ W -" when no week is on), " ~~ WC" right after it on a COLLECT week (every marked box must be gone
+//          to, week.COLLECT_R), " ~~ WF <place> <entry> <hero> <time> <name>" per fastest time,
 //          " ~~ WM <place> <entry> <runs> <name>" per most runs, and " ~~ WL <code> <route name> <fastest name> <time>
-//          <hero> <most name> <runs>" for last week's winners ("-" for one that's missing). Older games read none of them.
-//   The weekly board's own jobs (docs/BOXRUN-WEEKLY-BOARD.md 7.4). The entry key is kept as k:week = "BRW-...|<week id>"
-//   and sent only for its own week; the game never reads it.
+//          <hero> <most name> <runs>" for last week's winners ("-" for one that's missing), and " ~~ WN <n> <prev week id or ->"
+//          right after W's line (or WC's) when the API numbers its weeks (FIND-15), and " ~~ WLN <last week's id> <n>"
+//          after WL (and WLE). Older games read none of them.
+//   The weekly board's own jobs (docs/BOXRUN-WEEKLY-BOARD.md 7.4). Each week's entry key is kept as k:week:<week id> =
+//   "BRW-..." (and the latest as k:week = "BRW-...|<week id>", which pages before 11-12 kept: read for its week too) and
+//   sent only for its own week; the game never reads them.
 //   week:<week id>   (a week id is its first Pacific day, 2026-11-02, or 2026-11-02-2 for a second week opened that day)
 //          "Y <entry> <time> <runs> <place> <runs place> <of> <status> <name>" (places "-" while held) and
 //          the board's segments as featured has them; "Y -" with no entry. Without a key for that week it answers
@@ -117,8 +121,14 @@ function piece(key, k, value) {
 //          <time> <name>" and " ~~ YM <place> <entry> <runs> <name>" (the API's you.near); older games skip them.
 //   wsend:<idempotency key>:<week id>   the staged entry (POST /week/entry): "E <entry> <time> <runs> <best 1/0> <place>
 //          <runs place> <of> <week id>"; a new entry's key is kept as k:week before the game hears of it
-//   wdrop:<week id>   the entry and its ghost taken off (POST /week/withdraw): "K", and k:week goes
-//   wghost:<entry>   an entry's ghost, answered as ghost is (the code "-" for a week whose route isn't known)
+//   wdrop:<week id>   the entry and its ghost taken off that week (POST /week/withdraw?week=<id>): "K", and its key goes
+//   wghost:<entry>[:<week id>]   an entry's ghost (from that week), answered as ghost is (the code "-" for a week whose
+//          route isn't known)
+//   wweek:<week id>   one week's page (GET /weeks/<id>, docs/BOXRUN-WEEKLY-BOARD.md 18.4), with that week's key when kept:
+//          "P <id> <n> <prev or -> <next or -> <live 1/0> <code>.<version> <ends or ended> <entries> <collect 1/0> <route
+//          name>", then " ~~ PF <place> <entry or -> <hero> <time> <name>" per fastest row, " ~~ PM <place> <entry or ->
+//          <runs> <name>" per most-runs row, and with your entry " ~~ PY <entry> <time> <runs> <place> <runs place> <of>
+//          <status> <name>" (Y's fields). An odd row is left out.
 //   wrep:<entry>:<reason>   a report (time, ghost, name or other): "K"
 //   count  "K" once the server took it: one anonymous count, sent as text/plain with no cookies, key or other header,
 //          sent once, never tried again: the server adds every count it gets, so a second try after a lost answer
@@ -187,7 +197,10 @@ function shelfText(sh) {
 }
 // The anonymous counts (docs/BOXRUN-MEASUREMENT.md 5.4): the body is rebuilt from these fields alone, in this order, and
 // anything else the game put in is left out. Refused (the job fails) when a field is missing or out of range.
-var COUNT_STEPS = ["load", "menu", "seen", "shot", "press", "go", "ready", "start", "finish", "count", "make", "import", "community"], COUNT_MIN = [0, 1, 2, 5, 10, 30, 60, 1440];
+var COUNT_STEPS = ["load", "menu", "seen", "shot", "press", "go", "ready", "start", "finish", "count", "make", "import", "community", "drop"], COUNT_MIN = [0, 1, 2, 5, 10, 30, 60, 1440];
+// COUNT-12 (2.3.4): why the first finish did or didn't count (finish only, optional: older games send none), and how the
+// first run ended without a finish with the checkpoints passed as a bucket's lower edge (drop only, both needed)
+var COUNT_WHY = ["ok", "slow", "boxes", "collect", "hero", "noclip", "skip", "fast"], COUNT_HOW = ["restart", "reset", "route", "left"], COUNT_CP = [0, 1, 2, 5, 10];
 var COUNT_KINDS = ["sample", "pack", "community", "own"], COUNT_RUNS = ["start", "finish", "count"], COUNT_CODES = 20, COUNT_MAX = 512;
 function countBody(text) {
 	var d = JSON.parse(text), b = {};
@@ -199,6 +212,11 @@ function countBody(text) {
 	if (d.e === "step") {
 		if (COUNT_STEPS.indexOf(d.step) < 0 || COUNT_MIN.indexOf(d.min) < 0) throw new Error("bad step");
 		b.step = d.step; b.age = int(d.age, 400); b.min = d.min;
+		if (d.step === "finish" && d.why !== undefined) { if (COUNT_WHY.indexOf(d.why) < 0) throw new Error("bad why"); b.why = d.why; }
+		if (d.step === "drop") {
+			if (COUNT_HOW.indexOf(d.how) < 0 || COUNT_CP.indexOf(d.cp) < 0) throw new Error("bad drop");
+			b.how = d.how; b.cp = d.cp;
+		}
 	} else if (d.e === "day") {
 		b.age = int(d.age, 400); b.wk = int(d.wk, 1);
 		if (d.back !== undefined) { if (d.back !== "d1" && d.back !== "w2") throw new Error("bad back"); b.back = d.back; }
@@ -246,6 +264,8 @@ function boardText(bd) {
 	var t = "", w = bd.week, l = bd.last;
 	if (w && WEEK_ID.test(w.id) && /^BR-[0-9A-Z]{6}$/.test(w.code) && n(w.version, 1, 9999) && n(w.ends, 0, 9999999999) && n(w.entries, 0, 9999999)) {
 		t += " ~~ W " + w.id + " " + w.code + "." + w.version + " " + w.ends + " " + w.entries;
+		if (w.collect === true) t += " ~~ WC";        // a COLLECT week (SAFE-15): its own segment, older brains skip it
+		if (n(w.n, 1, 99999)) t += " ~~ WN " + w.n + " " + (WEEK_ID.test(w.prev || "") ? w.prev : "-");     // FIND-15's WEEK n
 		(Array.isArray(w.fastest) ? w.fastest : []).slice(0, 5).forEach(function (r) {
 			if (r && n(r.place, 1, 9) && ENTRY.test(r.entry) && HERO.test(r.hero) && time(r.time) && r.runner)
 				t += " ~~ WF " + r.place + " " + r.entry + " " + r.hero + " " + time(r.time) + " " + word(r.runner);
@@ -261,6 +281,8 @@ function boardText(bd) {
 			" " + (m ? word(m.runner) + " " + m.runs : "- -");
 		// last week's fastest entry while it's kept, for the game's WATCH (its own segment: older brains skip it)
 		if (f && ENTRY.test(f.entry || "")) t += " ~~ WLE " + f.entry;
+		// last week's id and number (FIND-15), so the game can open its page with no week on (older brains skip it)
+		if (WEEK_ID.test(l.id || "") && n(l.n, 1, 99999)) t += " ~~ WLN " + l.id + " " + l.n;
 	}
 	return t;
 }
@@ -282,9 +304,45 @@ function nearText(nr) {
 	});
 	return t;
 }
+var WKEY = /^BRW-[0-9A-Z]{26}$/;
 function weekKey(wid) {
-	var v = String(localStorage.getItem("k:week") || "").split("|");
-	return /^BRW-[0-9A-Z]{26}$/.test(v[0]) && v[1] === wid ? v[0] : "";
+	var k = localStorage.getItem("k:week:" + wid) || "";
+	if (WKEY.test(k)) return k;
+	var v = String(localStorage.getItem("k:week") || "").split("|");       // kept by pages before 11-12, one week only
+	return WKEY.test(v[0]) && v[1] === wid ? v[0] : "";
+}
+function weekKeep(wid, key) {
+	localStorage.setItem("k:week:" + wid, key);
+	localStorage.setItem("k:week", key + "|" + wid);                       // the latest, as older pages kept it
+}
+function weekForget(wid) {
+	localStorage.removeItem("k:week:" + wid);
+	if (String(localStorage.getItem("k:week") || "").split("|")[1] === wid) localStorage.removeItem("k:week");
+}
+// one week's page (wweek): its line, the rows and your entry; rows closed before entry ids were kept have "-"
+function pageText(b, key) {
+	var n = function (v, lo, hi) { return typeof v === "number" && v >= lo && v <= hi && Math.floor(v) === v; };
+	var time = function (v) { return typeof v === "number" && v > 0 && v < 10000 ? String(Math.round(v * 1000) / 1000) : ""; };
+	var word = function (v) { return v ? under(String(v).replace(/[~_\s]+/g, " ").trim()) : "-"; };
+	var wk = function (v) { return WEEK_ID.test(v || "") ? v : "-"; };
+	if (!b || !WEEK_ID.test(b.id) || !n(b.n, 1, 99999) || !/^BR-[0-9A-Z]{6}$/.test(b.code) || !n(b.version, 1, 9999) || !n(b.entries, 0, 9999999))
+		throw new Error("odd answer");
+	var at = b.live ? b.ends : b.ended;
+	var t = "P " + b.id + " " + b.n + " " + wk(b.prev) + " " + wk(b.next) + " " + (b.live ? 1 : 0) + " " + b.code + "." + b.version + " " +
+		(n(at, 0, 9999999999) ? at : 0) + " " + b.entries + " " + (b.collect === true ? 1 : 0) + " " + word(b.name);
+	(Array.isArray(b.fastest) ? b.fastest : []).slice(0, 5).forEach(function (r) {
+		if (r && n(r.place, 1, 9) && (r.entry === undefined || ENTRY.test(r.entry)) && HERO.test(r.hero) && time(r.time) && r.runner)
+			t += " ~~ PF " + r.place + " " + (r.entry || "-") + " " + r.hero + " " + time(r.time) + " " + word(r.runner);
+	});
+	(Array.isArray(b.most) ? b.most : []).slice(0, 3).forEach(function (r) {
+		if (r && n(r.place, 1, 9) && (r.entry === undefined || ENTRY.test(r.entry)) && n(r.runs, 1, 99999) && r.runner)
+			t += " ~~ PM " + r.place + " " + (r.entry || "-") + " " + r.runs + " " + word(r.runner);
+	});
+	var y = key && b.you;
+	if (y && ENTRY.test(y.entry) && time(y.time))
+		t += " ~~ PY " + y.entry + " " + y.time + " " + y.runs + " " + place(y.place) + " " + place(y.runs_place) + " " + (y.of || 0) + " " +
+			(y.status === "ok" ? "ok" : "held") + " " + under(y.runner);
+	return t;
 }
 function place(v) { return typeof v === "number" && v > 0 ? String(v) : "-"; }
 function weekJob(j, verb, args) {
@@ -293,7 +351,8 @@ function weekJob(j, verb, args) {
 		if (!ENTRY.test(wid)) return fail(j, "bad_request not a board entry");
 		if (verb === "wrep") return call(j, "POST", "/week/entries/" + wid + "/report", JSON.stringify({ reason: args[1] || "other" }), null,
 			function () { return "K"; });
-		return call(j, "GET", "/week/entries/" + wid + "/ghost", null, null, function (b) {
+		if (args[1] && !WEEK_ID.test(args[1])) return fail(j, "bad_request not a week");
+		return call(j, "GET", "/week/entries/" + wid + "/ghost" + (args[1] ? "?week=" + args[1] : ""), null, null, function (b) {
 			if (b.path && !/^BRGP1\.[A-Za-z0-9._]+=*$/.test(b.path)) throw new Error("odd path");
 			return "G " + (b.code || "-") + "." + b.version + " " + b.hero + " " + b.souls + " " + b.time + " " + under(b.runner) + " " +
 				(b.step || 0) + " " + (b.spot || 0) + " " + b.botrec + (b.path ? " " + b.path : "");
@@ -301,6 +360,7 @@ function weekJob(j, verb, args) {
 	}
 	if (!WEEK_ID.test(wid)) return fail(j, "bad_request not a week");
 	var key = weekKey(wid);
+	if (verb === "wweek") return call(j, "GET", "/weeks/" + wid, null, key || null, function (b) { return pageText(b, key); });
 	if (verb === "week") {
 		if (!key) return done(j, "Y -");
 		return call(j, "GET", "/week", null, key, function (b) {
@@ -312,21 +372,21 @@ function weekJob(j, verb, args) {
 	}
 	if (verb === "wdrop") {
 		if (!key) return fail(j, "not_found You have no time on this week's board.");
-		return call(j, "POST", "/week/withdraw", null, key, function () { localStorage.removeItem("k:week"); return "K"; });
+		return call(j, "POST", "/week/withdraw?week=" + wid, null, key, function () { weekForget(wid); return "K"; });
 	}
 	if (verb !== "wsend") return fail(j, "bad_request unknown request " + verb);
 	var body = j.staged.join("");
 	if (!body) return fail(j, "bad_request nothing was staged");
 	return call(j, "POST", "/week/entry", body, key || null, function (b) {
 		if (!ENTRY.test(b.entry) || !WEEK_ID.test(b.week) || (b.key && !/^BRW-[0-9A-Z]{26}$/.test(b.key))) throw new Error("odd answer");
-		if (b.key) localStorage.setItem("k:week", b.key + "|" + b.week);       // kept before the game hears of it
+		if (b.key) weekKeep(b.week, b.key);                                 // kept before the game hears of it
 		return "E " + b.entry + " " + b.time + " " + b.runs + " " + (b.best ? 1 : 0) + " " + place(b.place) + " " + place(b.runs_place) +
 			" " + (b.of || 0) + " " + b.week;
 	});
 }
 function start(j, verb, args) {
 	var code = args[0] || "";
-	if (/^(week|wsend|wdrop|wghost|wrep)$/.test(verb)) {
+	if (/^(week|wsend|wdrop|wghost|wrep|wweek)$/.test(verb)) {
 		if (verb === "wsend" && /^[a-z0-9-]{8,64}$/.test(args[0] || "")) j.idem = args[0];
 		return weekJob(j, verb, args);
 	}
