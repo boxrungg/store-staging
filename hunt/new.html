@@ -174,12 +174,17 @@ function code6(code) { return String(code).toUpperCase().replace(/^BR-?/, "").sp
 function codeOk(code) { return /^(BR-?)?[0-9A-Z]{6}(\.[0-9]{1,4})?$/i.test(code); }
 function under(s) { return s ? String(s).replace(/ /g, "_") : "-"; }
 // the COMMUNITY shelf's routes as " ~~ S ..." segments; an odd item is left out, never the answer. Up to SHELF_MAX a
-// list (shelf.py LIST_MAX, 40 since 11-08; was 12): at every card's longest about 28.5 KB, 8 title pieces
-var SHELF_MAX = 40;
+// list (shelf.py LIST_MAX, 120 since 11-18 so the library holds every listed route; 40 from 11-08; was 12).
+// Route finding (11-18, work/routefind/design-D BUILD.md piece 2), once a route, in segments older games skip:
+// " ~~ ST <code> <TAG,TAG,... or -> <main> <souls>" (tags with _ for spaces), " ~~ SV <code> <creator> <m:ss> <title>"
+// (BoxRun's video credit), " ~~ SN <code>" (listed in the last 7 days with a ghost); and the samples' cards as
+// " ~~ S samples ..." (their players this week), a list older games' shelf reading doesn't match.
+var SHELF_MAX = 120, TAG_RE = /^[A-Z][A-Z ]{1,15}$/;
 function shelfText(sh) {
 	var t = "", n = function (v, max) { return typeof v === "number" && v >= 0 && v <= max && Math.floor(v) === v; };
 	var word = function (v) { return v ? under(String(v).replace(/[~_\s]+/g, " ").trim()) : "-"; };
-	["pick", "featured", "popular", "new"].forEach(function (k) {
+	var told = {};
+	["pick", "featured", "popular", "new", "samples"].forEach(function (k) {
 		(Array.isArray(sh[k]) ? sh[k] : []).slice(0, SHELF_MAX).forEach(function (c) {
 			if (!c || !/^BR-[0-9A-Z]{6}$/.test(c.code) || !(c.version > 0) || !/^[a-z0-9_]{1,40}$/.test(c.map || "") ||
 				!n(c.checkpoints, 999) || !n(c.boxes, 9999) || !n(c.players, 9999999) || !c.name) return;
@@ -191,16 +196,38 @@ function shelfText(sh) {
 			// the route's line for its postcard (shelf.py line(): 6 base-36 characters a point, 2 to 24 points) in a segment
 			// of its own, which older games' shelf reading skips
 			if (typeof c.line === "string" && /^[0-9a-z]{12,144}$/.test(c.line) && c.line.length % 6 === 0) t += " ~~ SP " + c.code + " " + c.line;
+			if (told[c.code]) return;
+			told[c.code] = 1;
+			if (Array.isArray(c.tags) && c.tags.length <= 24 && c.tags.every(function (g) { return typeof g === "string" && TAG_RE.test(g); }) &&
+				(c.main === "FARM" || c.main === "MOVEMENT") && n(c.souls, 999999))
+				t += " ~~ ST " + c.code + " " + (c.tags.length ? c.tags.map(under).join(",") : "-") + " " + c.main + " " + c.souls;
+			var v = c.video;
+			if (v && typeof v.creator === "string" && v.creator.trim() && typeof v.title === "string" && v.title.trim() &&
+				/^(\d{1,2}:)?\d{1,2}:\d\d$/.test(v.time || ""))
+				t += " ~~ SV " + c.code + " " + word(v.creator.slice(0, 32)) + " " + v.time + " " + word(v.title.slice(0, 60));
+			if (c["new"] === true) t += " ~~ SN " + c.code;
 		});
 	});
 	return t;
 }
 // The anonymous counts (docs/BOXRUN-MEASUREMENT.md 5.4): the body is rebuilt from these fields alone, in this order, and
 // anything else the game put in is left out. Refused (the job fails) when a field is missing or out of range.
-var COUNT_STEPS = ["load", "menu", "seen", "shot", "press", "go", "ready", "start", "finish", "count", "make", "import", "community", "drop"], COUNT_MIN = [0, 1, 2, 5, 10, 30, 60, 1440];
+var COUNT_STEPS = ["load", "menu", "seen", "shot", "press", "go", "ready", "start", "finish", "count", "make", "import", "community", "drop", "lane", "filter"], COUNT_MIN = [0, 1, 2, 5, 10, 30, 60, 1440];
 // COUNT-12 (2.3.4): why the first finish did or didn't count (finish only, optional: older games send none), and how the
 // first run ended without a finish with the checkpoints passed as a bucket's lower edge (drop only, both needed)
 var COUNT_WHY = ["ok", "slow", "boxes", "collect", "hero", "noclip", "skip", "fast"], COUNT_HOW = ["restart", "reset", "route", "left"], COUNT_CP = [0, 1, 2, 5, 10];
+// Route finding (3.0): where a route load came from, as count.py checks it: one of COUNT_FROM, farm:<cell> or move:<tag>.
+// Optional on the load step (left out of other steps, like why); on runs, {source: loads} with at most COUNT_FROM_MAX sources.
+var COUNT_FROM = ["home", "week", "move", "new", "creators", "mine", "star", "tobeat", "filter", "page-tag", "next", "code"];
+var COUNT_FARM = ["hk-yellow", "hk-blue", "hk-green", "am-yellow", "am-blue", "am-green", "jungle", "midboss", "all"];
+var COUNT_MOVE = ["zipline", "wall-jump", "vent", "mantle", "slide", "bridge-buff", "guardian", "healing-bats", "soul-urn"], COUNT_FROM_MAX = 12;
+function countFrom(v) {
+	if (typeof v !== "string") return false;
+	var i = v.indexOf(":");
+	if (i < 0) return COUNT_FROM.indexOf(v) >= 0;
+	var kind = v.slice(0, i), sub = v.slice(i + 1);
+	return kind === "farm" && COUNT_FARM.indexOf(sub) >= 0 || kind === "move" && COUNT_MOVE.indexOf(sub) >= 0;
+}
 var COUNT_KINDS = ["sample", "pack", "community", "own"], COUNT_RUNS = ["start", "finish", "count"], COUNT_CODES = 20, COUNT_MAX = 512;
 function countBody(text) {
 	var d = JSON.parse(text), b = {};
@@ -217,6 +244,7 @@ function countBody(text) {
 			if (COUNT_HOW.indexOf(d.how) < 0 || COUNT_CP.indexOf(d.cp) < 0) throw new Error("bad drop");
 			b.how = d.how; b.cp = d.cp;
 		}
+		if (d.step === "load" && d.from !== undefined) { if (!countFrom(d.from)) throw new Error("bad from"); b.from = d.from; }
 	} else if (d.e === "day") {
 		b.age = int(d.age, 400); b.wk = int(d.wk, 1);
 		if (d.back !== undefined) { if (d.back !== "d1" && d.back !== "w2") throw new Error("bad back"); b.back = d.back; }
@@ -231,6 +259,12 @@ function countBody(text) {
 		cs.forEach(function (c) { b.codes[code(c)] = int(d.codes[c], 999); });
 		b["new"] = [];
 		d["new"].forEach(function (c) { if (b["new"].indexOf(code(c)) < 0) b["new"].push(c); });
+		if (d.from !== undefined) {
+			var fs = d.from && typeof d.from === "object" && !Array.isArray(d.from) ? Object.keys(d.from) : null;
+			if (!fs || fs.length > COUNT_FROM_MAX || !fs.every(countFrom)) throw new Error("bad from");
+			b.from = {};
+			fs.forEach(function (k) { b.from[k] = int(d.from[k], 10000); });
+		}
 	} else throw new Error("unknown count");
 	var out = JSON.stringify(b);
 	if (out.length > COUNT_MAX) throw new Error("too long");
@@ -441,6 +475,15 @@ function start(j, verb, args) {
 	}
 	var body = j.staged.join("");
 	if (!body) return fail(j, "bad_request nothing was staged");
+	// the maker's tags (route finding, 11-18): {"tags": [...], "main": ...} with this PC's edit key; META only on the API
+	if (verb === "tags") {
+		var tk = localStorage.getItem("k:" + code6(code).toLowerCase());
+		if (!tk) return fail(j, "no_key this PC has no edit key for " + code);
+		return call(j, "PUT", path + "/tags", body, tk, function (b) {
+			if (!/^BR-[0-9A-Z]{6}$/.test(b.code) || !Array.isArray(b.tags)) throw new Error("odd answer");
+			return "TG " + b.code + " " + (b.tags.length ? b.tags.map(under).join(",") : "-") + " " + (b.main || "-");
+		});
+	}
 	if (verb === "pub") return call(j, "POST", "/routes", body, null, function (b) {
 		if (!/^BR-[0-9A-Z]{6}$/.test(b.code) || !/^BRK-[0-9A-Z]{26}$/.test(b.edit_key)) throw new Error("odd answer");
 		localStorage.setItem("k:" + code6(b.code).toLowerCase(), b.edit_key);   // kept before the game hears of it
