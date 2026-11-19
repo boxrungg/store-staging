@@ -1,1 +1,1 @@
-ns=e30a page=new api=https://api.boxrun.gg/v1
+ns=e30shots page=new api=https://api.boxrun.gg/v1
