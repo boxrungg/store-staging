@@ -230,6 +230,7 @@ function countFrom(v) {
 	return kind === "farm" && COUNT_FARM.indexOf(sub) >= 0 || kind === "move" && COUNT_MOVE.indexOf(sub) >= 0;
 }
 var COUNT_KINDS = ["sample", "pack", "community", "own"], COUNT_RUNS = ["start", "finish", "count"], COUNT_CODES = 20, COUNT_MAX = 512;
+var COUNT_PER_CODE = ["started", "finished"];
 function countBody(text) {
 	var d = JSON.parse(text), b = {};
 	var int = function (v, hi) { if (typeof v !== "number" || Math.floor(v) !== v || v < 0 || v > hi) throw new Error("a count out of range"); return v; };
@@ -266,6 +267,14 @@ function countBody(text) {
 			b.from = {};
 			fs.forEach(function (k) { b.from[k] = int(d.from[k], 10000); });
 		}
+		// 3.0: runs started and finished per code, for a finish rate (no times); optional, with the limits of codes
+		COUNT_PER_CODE.forEach(function (f) {
+			if (d[f] === undefined) return;
+			var ks = d[f] && typeof d[f] === "object" && !Array.isArray(d[f]) ? Object.keys(d[f]) : null;
+			if (!ks || ks.length > COUNT_CODES) throw new Error("bad " + f);
+			b[f] = {};
+			ks.forEach(function (c) { b[f][code(c)] = int(d[f][c], 999); });
+		});
 	} else throw new Error("unknown count");
 	var out = JSON.stringify(b);
 	if (out.length > COUNT_MAX) throw new Error("too long");
