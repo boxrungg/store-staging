@@ -9,6 +9,7 @@
 //   pad=<n>     fill the origin's storage with "zzpad|<i>" keys until full, then free about n characters, so the page's
 //               store is full with nothing it may make room from; no pad word: every "zzpad|" key is removed
 //   clear=<name> remove every key under "<name>|" before the page runs
+//   fix=1       first apply fix.json (rows deleted and put back), e.g. with hold=1 so the page never answers
 // Never on save.boxrun.gg.
 (function () {
 	function get(u) { var x = new XMLHttpRequest(); x.open("GET", u + "?t=" + Date.now(), false); x.send(); if (x.status !== 200) throw new Error(u + " " + x.status); return x.responseText; }
@@ -47,6 +48,16 @@
 		new Function("localStorage", js)(store);
 	}
 	function wait() { var c = cfgRead(); if (c.hold === "1") setTimeout(wait, 3000); else run(c); }
+	// fix=1: put the staging store's rows back from fix.json ({"del": [keys], "put": {key: value}}) before anything else
+	var c0 = cfgRead();
+	if (c0.fix === "1") {
+		try {
+			var f = JSON.parse(get("fix.json"));
+			(f.del || []).forEach(function (k) { L.removeItem(k); });
+			Object.keys(f.put || {}).forEach(function (k) { L.setItem(k, f.put[k]); });
+			window.BRFIX = "done";
+		} catch (e) { window.BRFIX = String(e); }
+	}
 	wait();
 })();
 </script>
