@@ -1,0 +1,635 @@
+<!doctype html>
+<meta charset="utf-8">
+<title>BRS ready</title>
+<script>
+// BoxRun store: BoxRun's in-map menu opens this page in Deadlock's built-in browser (a hidden HTML panel) to keep
+// your routes, best times and settings between game sessions. Everything stays in this page's local storage on your
+// PC; requests arrive in the URL's #fragment, which browsers never send to a server, and answers go back through the
+// page title, which the game reads (mod/boxrun/README.md, map note MN-322).
+//
+// DRAFT v2 (api/client/store.html; the live page is mod/boxrun/web/store.html): everything above still
+// works the same, and the page can also reach BoxRun's online codes at api.boxrun.gg when the game asks it to
+// (docs/BOXRUN-SHORT-CODES-PROTOCOL.md). Only then does it contact a server: to publish a route, look up a short
+// code, fetch a ghost, send a report or list a route of yours in COMMUNITY. Edit keys for routes you publish stay in this page's storage.
+// It also sends BoxRun's anonymous counts (docs/BOXRUN-MEASUREMENT.md 5.4) unless OPTIONS > MORE > COUNTS is off: each
+// is rebuilt here from a fixed list of fields (an event name, small whole numbers, BoxRun's version, public short codes),
+// so nothing else can leave.
+//
+// Request: #<seq>:<op> with op one of (values URL-encoded):
+//   put:<key>:<value>   app:<key>:<value> (append)   del:<key>   dump:<k>   ping
+//   pc:<key>:<k>:<value> (piece k of a value, idempotent; 1.6.6; "bad op" on an older page)
+//   pc:<key>:<k>/<n>:<value> (piece k of n, 3.2.1 r1: the value is built aside and takes the old one's place at its last
+//     piece; pages from 1.6.6 to 3.2.1 read k alone, as parseInt stops at the "/")
+//   ver   get:<key>:<k>   (v2)
+//   net:<job>:<what>   stage:<job>:<k>:<piece>   job:<job>:<k>   drop:<job>   (v2, online codes)
+// Keys: r:<name> a route code, b:<name> its best time, p:<key> a setting; (v2) g:<name> a ghost,
+//   k:<code> the edit key of a route you published.
+// A write that doesn't fit (the page's storage is full, about 5 MB a site) answers "full" (3.2.1; an older page answered
+//   "err QuotaExceededError..."): a put keeps the value it had, and so does a value sent as k/n pieces, whichever piece
+//   doesn't fit (the pieces built aside go, freeing their room). Pieces without /n (games before 3.2.1 r1) go in place:
+//   piece 0 keeps the value before it, a later piece takes the value's earlier pieces away (a value cut short is no use).
+//   Games before 3.2.1 read any answer but "ok" as not saved, as they read the err.
+// Answer: title "BRS <seq> <reply>"; dump replies "d <k>/<n> <text>", the dump being
+//   "R <name> <best or -> <route code>" and "P <key> <value>" entries joined by " ~~ ", in pieces of 3800 characters
+//   (titles reach the game cut at 4096). get and job answer in the same pieces.
+var KEY = /^[rbpgk]:[a-z0-9_]{1,40}$/, PIECE = 3800;
+var API = "https://api.boxrun.gg/v1";
+var JOB = /^[a-z0-9]{1,16}$/, MAX_JOBS = 8, STAGE_MAX = 460000, TRIES = 3, TIMEOUT = 20000;
+var jobs = {}, order = [];
+function dump() {
+	var out = [];
+	for (var i = 0; i < localStorage.length; i++) {
+		var k = localStorage.key(i);
+		if (/^r:/.test(k)) {
+			var name = k.slice(2), best = localStorage.getItem("b:" + name);
+			out.push("R " + name + " " + (best || "-") + " " + localStorage.getItem(k));
+		} else if (/^p:/.test(k)) {
+			out.push("P " + k.slice(2) + " " + localStorage.getItem(k));
+		}
+	}
+	return out.sort().join(" ~~ ");
+}
+function pieces(text, k) {
+	var n = Math.max(1, Math.ceil(text.length / PIECE));
+	return "d " + k + "/" + n + " " + text.substr(k * PIECE, PIECE);
+}
+function answer(op) {
+	var f = op.split(":"), what = f[0];
+	if (what === "ping") return "pong";
+	if (what === "ver") return "v2";
+	if (what === "dump") return pieces(dump(), parseInt(f[1], 10) || 0);
+	if (what === "net" || what === "stage" || what === "job" || what === "drop") return online(f);
+	var key = f[1] + ":" + f[2];
+	if (!KEY.test(key)) return "bad key";
+	if (what === "get") {
+		var v = localStorage.getItem(key);
+		return v === null ? "none" : pieces(v, parseInt(f[3], 10) || 0);
+	}
+	if (what === "pc") return piece(key, f[3], f.slice(4).join(":"));
+	var value = f.slice(3).join(":");
+	if (what === "put") localStorage.setItem(key, value);
+	else if (what === "app") cutOnFull(key, function () { localStorage.setItem(key, (localStorage.getItem(key) || "") + value); });
+	else if (what === "del") { localStorage.removeItem(key); localStorage.removeItem("c:" + key); localStorage.removeItem("n:" + key); localStorage.removeItem("c:n:" + key); }
+	else return "bad op";
+	return "ok";
+}
+// pc:<key>:<k>:<value>, piece k of a value sent in pieces (the timing audit's B9): asked again after a lost answer, app:
+// appended a piece twice and corrupted the saved route or ghost. Piece 0 starts the value over; piece k is appended only
+// when it's the next one (the count is kept under c:<key>), and one already in is answered "ok" again. The value is
+// stored as put: and app: store it, so older games read it.
+function piece(key, k, value) {
+	var kn = /^(\d+)(?:\/(\d+))?$/.exec(k);
+	if (!kn) return "bad piece";
+	k = parseInt(kn[1], 10);
+	var n = kn[2] ? parseInt(kn[2], 10) : 0;
+	if (kn[2] && !(k < n)) return "bad piece";
+	if (n > 1) return pieceAside(key, k, n, value);
+	var have = parseInt(localStorage.getItem("c:" + key), 10) || 0;
+	// piece 0: the count goes first, so a value that doesn't fit leaves the one before it whole (and no count that would
+	// pass the next pieces as already in). The count's own write failing puts the value before it back (review r1, finding
+	// 2: the new piece stayed, a prefix of the value, once removing the count had made just room for it)
+	if (k === 0) { keepOnFull(key, function () { localStorage.removeItem("c:" + key); localStorage.setItem(key, value); localStorage.setItem("c:" + key, "1"); }); return "ok"; }
+	if (k < have) return "ok";
+	if (k > have) return "gap " + have;
+	cutOnFull(key, function () {
+		localStorage.setItem(key, (localStorage.getItem(key) || "") + value);
+		localStorage.setItem("c:" + key, String(k + 1));
+	});
+	return "ok";
+}
+// pc:<key>:<k>/<n> with n > 1 (3.2.1 r1, review finding 2): the pieces build up under n:<key> (count c:n:<key>, neither in
+// the dump), and the last one puts the whole value in the old one's place at once, so a value being replaced stays whole
+// until its new one is all in, and a piece that doesn't fit leaves it as it was (the pieces built aside go). The last
+// piece asked again after it went in (its answer lost) finds the value's count at n: "ok".
+function pieceAside(key, k, n, value) {
+	var ak = "n:" + key, ac = "c:" + ak, have = parseInt(localStorage.getItem(ac), 10) || 0;
+	// piece 0 also drops the old value's count: a last piece that comes after a failed build then can't pass as in
+	if (k === 0) { localStorage.removeItem(ak); localStorage.removeItem(ac); localStorage.removeItem("c:" + key); have = 0; }
+	else if (!have) return k === n - 1 && localStorage.getItem("c:" + key) === String(n) ? "ok" : "gap 0";
+	else if (k < have) return "ok";
+	else if (k > have) return "gap " + have;
+	var v = (k ? localStorage.getItem(ak) || "" : "") + value;
+	if (k < n - 1) {
+		try { localStorage.setItem(ak, v); localStorage.setItem(ac, String(k + 1)); }
+		catch (e) { if (isFull(e)) { localStorage.removeItem(ak); localStorage.removeItem(ac); } throw e; }
+		return "ok";
+	}
+	localStorage.removeItem(ak); localStorage.removeItem(ac);
+	keepOnFull(key, function () { localStorage.removeItem("c:" + key); localStorage.setItem(key, v); localStorage.setItem("c:" + key, String(n)); });
+	return "ok";
+}
+// a write that doesn't fit puts back the value key had (its count stays gone: no later piece passes as already in)
+function keepOnFull(key, write) {
+	var old = localStorage.getItem(key);
+	try { write(); } catch (e) {
+		if (isFull(e)) try { if (old === null) localStorage.removeItem(key); else localStorage.setItem(key, old); } catch (e2) { }
+		throw e;
+	}
+}
+// localStorage's own error when a write doesn't fit (Chrome and Steam's browser: QuotaExceededError, code 22; Firefox:
+// NS_ERROR_DOM_QUOTA_REACHED, 1014)
+function isFull(e) {
+	return !!e && (e.name === "QuotaExceededError" || e.name === "NS_ERROR_DOM_QUOTA_REACHED" || e.code === 22 || e.code === 1014 || /quota/i.test(String(e.message || e)));
+}
+// a later piece that doesn't fit: the value's earlier pieces go too, then the error goes on to handle()
+function cutOnFull(key, write) {
+	try { write(); } catch (e) {
+		if (isFull(e)) { localStorage.removeItem(key); localStorage.removeItem("c:" + key); }
+		throw e;
+	}
+}
+
+// ------------------------------------------------------------------------------------------- online codes (v2)
+// A job is one request to the API, named by the game (<job>), so asking again after a lost answer finds the same job
+// instead of sending the request twice. Uploads are staged in pieces first; results are read back in pieces.
+//   net:<job>:fetch:<code>   net:<job>:ghost:<code>   net:<job>:pub   net:<job>:upd:<code>
+//   net:<job>:report:<code>:<reason>   net:<job>:featured[:0]   net:<job>:list:<code>:<1 or 0>   net:<job>:count:<json>
+// Codes are BR-XXXXXX or BR-XXXXXX.<version>. pub and upd send the staged text, a JSON body {"route", "ghost"?}.
+// Job answers: "w" (working), "e <error> <message>", or the result in pieces "d <k>/<n> <text>":
+//   fetch  "R <code>.<version> <latest> <sum> <BR1 code>", then " ~~ G <hero> <souls> <time> <chars> <runner>"
+//          when that version has a ghost, then " ~~ N <players>" (distinct players who loaded the code, when the
+//          API sends it; older games read neither), then " ~~ T <1 or 0>" (listed in COMMUNITY or code only, when the
+//          API sends it; older games ignore it)
+//   ghost  "G <code>.<version> <hero> <souls> <time> <runner> <path step ms or 0> <spot> <BOTREC code>[ <BRGP1 path>]"
+//   pub, upd  "P <code> <version> <sum>" (pub keeps the new edit key as k:<code>)
+//   report "K"
+//   list   "T <code> <1 or 0>": the route listed in COMMUNITY (1) or code only (0), with the stored edit key
+//   featured  "F <code>.<version> <name with _ for spaces>" (the week's featured route) or "F -" when none, then
+//          " ~~ V <latest BoxRun version>", " ~~ M <notice with _ for spaces>", " ~~ O" (codes switched off) and
+//          " ~~ AG 0" (the puppet's animation graph switched off, admin.py ag off), each only when set; then, when the API has the COMMUNITY shelf, " ~~ L" and one " ~~ S <list> <code>.<version>
+//          <map> <kind or -> <checkpoints> <boxes> <urn 0/1> <hero or -> <gold/silver/bronze or -> <players> <name>
+//          <maker or ->" per route (list: pick, featured, popular, new; names with _ for spaces), each followed by
+//          " ~~ SP <code> <line>" when the API sends the route's line (shelf.py line(); older games skip it). featured:0 (counts off)
+//          asks /featured?count=0, which the server limits under its own name and the stats never read.
+//          Then, when the API has the weekly board (docs/BOXRUN-WEEKLY-BOARD.md 7.4), " ~~ W <week id> <code>.<version> <ends>
+//          <entries>" (" ~~ W -" when no week is on), " ~~ WC" right after it on a COLLECT week (every marked box must be gone
+//          to, week.COLLECT_R), " ~~ WF <place> <entry> <hero> <time> <name>" per fastest time,
+//          " ~~ WM <place> <entry> <runs> <name>" per most runs, and " ~~ WL <code> <route name> <fastest name> <time>
+//          <hero> <most name> <runs>" for last week's winners ("-" for one that's missing), and " ~~ WN <n> <prev week id or ->"
+//          right after W's line (or WC's) when the API numbers its weeks (FIND-15), and " ~~ WLN <last week's id> <n>"
+//          after WL (and WLE). Older games read none of them. 3.2: " ~~ WK <maker>" after the week's WM rows, the maker
+//          the week rolled with (week.open_week; not the route's latest credit), when the week has one.
+//   The weekly board's own jobs (docs/BOXRUN-WEEKLY-BOARD.md 7.4). Each week's entry key is kept as k:week:<week id> =
+//   "BRW-..." (and the latest as k:week = "BRW-...|<week id>", which pages before 11-12 kept: read for its week too) and
+//   sent only for its own week; the game never reads them.
+//   week:<week id>   (a week id is its first Pacific day, 2026-11-02, or 2026-11-02-2 for a second week opened that day)
+//          "Y <entry> <time> <runs> <place> <runs place> <of> <status> <name>" (places "-" while held) and
+//          the board's segments as featured has them; "Y -" with no entry. Without a key for that week it answers
+//          "Y -" from here, with no request. Then the entries just above and below yours, " ~~ YF <place> <entry> <hero>
+//          <time> <name>" and " ~~ YM <place> <entry> <runs> <name>" (the API's you.near); older games skip them.
+//   wsend:<idempotency key>:<week id>[:2]   the staged entry (POST /week/entry): "E <entry> <time> <runs> <best 1/0> <place>
+//          <runs place> <of> <week id>"; a new entry's key is kept as k:week before the game hears of it. With ":2" (3.2
+//          games) and the name the send carried kept (a board name changes once a UTC day), then " ~~ EN <unix time it
+//          can change> <the name on the board>"; without ":2" the E line alone, as older games read it
+//   wdrop:<week id>   the entry and its ghost taken off that week (POST /week/withdraw?week=<id>): "K", and its key goes
+//   wghost:<entry>[:<week id>]   an entry's ghost (from that week), answered as ghost is (the code "-" for a week whose
+//          route isn't known)
+//   wweek:<week id>   one week's page (GET /weeks/<id>, docs/BOXRUN-WEEKLY-BOARD.md 18.4), with that week's key when kept:
+//          "P <id> <n> <prev or -> <next or -> <live 1/0> <code>.<version> <ends or ended> <entries> <collect 1/0> <route
+//          name>", then " ~~ PF <place> <entry or -> <hero> <time> <name>" per fastest row, " ~~ PM <place> <entry or ->
+//          <runs> <name>" per most-runs row, and with your entry " ~~ PY <entry> <time> <runs> <place> <runs place> <of>
+//          <status> <name>" (Y's fields). An odd row is left out. 3.2: " ~~ PK <maker>" after the PM rows (before PY),
+//          the maker that week rolled with, when it has one.
+//   wrep:<entry>:<reason>   a report (time, ghost, name or other): "K"
+//   mstats:<code>   (3.2) your route's numbers, with this PC's edit key (GET /routes/<code>/stats): "MS <code>
+//          <players this week> <players> <runners> <started this week> <finished this week> <finish rate 0-1 or ->",
+//          the rate "-" under 20 started; "e no_key ..." without the key. An older page answers "e bad_request nothing
+//          was staged"
+//   count  "K" once the server took it: one anonymous count, sent as text/plain with no cookies, key or other header,
+//          sent once, never tried again: the server adds every count it gets, so a second try after a lost answer
+//          could double it, and a lost one only undercounts. "e not_found" when the API has no /v1/count (a 404), so
+//          the game stops counting for the session (countBody says what may be in it)
+// Runner names have "_" for spaces and "-" when empty (the route text whitelist has neither "_" nor "~").
+function online(f) {
+	var what = f[0], id = f[1];
+	if (!JOB.test(id || "")) return "bad job";
+	var j = jobs[id];
+	if (what === "drop") { delete jobs[id]; return "ok"; }
+	if (what === "stage") {
+		var k = parseInt(f[2], 10), text = f.slice(3).join(":");
+		if (!j) j = newJob(id);
+		if (j.state !== "staging") return "e bad_request the job has started";
+		if (k === j.staged.length && j.size + text.length <= STAGE_MAX) { j.staged.push(text); j.size += text.length; }
+		else if (k === j.staged.length) return "e too_large the upload is too long";
+		return "s " + j.staged.length;
+	}
+	if (what === "job") {
+		if (!j) return "e no_job the page has no such job (it may have reloaded): start it again";
+		if (j.state === "done") return pieces(j.result, parseInt(f[2], 10) || 0);
+		if (j.state === "error") return "e " + j.error;
+		return "w";
+	}
+	// net
+	if (j && j.state !== "staging") return j.state === "error" ? "e " + j.error : "w";
+	if (!j) j = newJob(id);
+	j.state = "working";
+	try { start(j, f[2], f.slice(3)); } catch (e) { fail(j, "bad_request " + e.message); }
+	return j.state === "error" ? "e " + j.error : "w";
+}
+function newJob(id) {
+	var j = jobs[id] = { id: id, state: "staging", staged: [], size: 0, result: "", error: "",
+		idem: id + "-" + Math.random().toString(36).slice(2, 12) };
+	order.push(id);
+	while (order.length > MAX_JOBS) delete jobs[order.shift()];
+	return j;
+}
+function fail(j, error) { j.state = "error"; j.error = error; }
+function done(j, text) { j.state = "done"; j.result = text; j.staged = []; }
+function code6(code) { return String(code).toUpperCase().replace(/^BR-?/, "").split(".")[0]; }
+function codeOk(code) { return /^(BR-?)?[0-9A-Z]{6}(\.[0-9]{1,4})?$/i.test(code); }
+function under(s) { return s ? String(s).replace(/ /g, "_") : "-"; }
+// the COMMUNITY shelf's routes as " ~~ S ..." segments; an odd item is left out, never the answer. Up to SHELF_MAX a
+// list (shelf.py LIST_MAX, 170 since 11-20 (lens 11-21), 120 from 11-18; 40 from 11-08; was 12).
+// Route finding (11-18, work/routefind/design-D BUILD.md piece 2), once a route, in segments older games skip:
+// " ~~ ST <code> <TAG,TAG,... or -> <main> <souls>" (tags with _ for spaces), " ~~ SV <code> <creator> <m:ss> <title>"
+// (BoxRun's video credit), " ~~ SN <code>" (listed in the last 7 days with a ghost), " ~~ SG <code> <seconds>" (3.0.1:
+// the latest version's route ghost time, to 2 places, for FARM's sort; 3.0 games skip it); and the samples' cards as
+// " ~~ S samples ..." (their players this week), a list older games' shelf reading doesn't match.
+var SHELF_MAX = 170, TAG_RE = /^[A-Z][A-Z ]{1,15}$/;
+function shelfText(sh) {
+	var t = "", n = function (v, max) { return typeof v === "number" && v >= 0 && v <= max && Math.floor(v) === v; };
+	var word = function (v) { return v ? under(String(v).replace(/[~_\s]+/g, " ").trim()) : "-"; };
+	var told = {};
+	["pick", "featured", "popular", "new", "samples"].forEach(function (k) {
+		(Array.isArray(sh[k]) ? sh[k] : []).slice(0, SHELF_MAX).forEach(function (c) {
+			if (!c || !/^BR-[0-9A-Z]{6}$/.test(c.code) || !(c.version > 0) || !/^[a-z0-9_]{1,40}$/.test(c.map || "") ||
+				!n(c.checkpoints, 999) || !n(c.boxes, 9999) || !n(c.players, 9999999) || !c.name) return;
+			var ti = c.tiers && [c.tiers.gold, c.tiers.silver, c.tiers.bronze].every(function (x) { return typeof x === "number" && x > 0; }) ?
+				[c.tiers.gold, c.tiers.silver, c.tiers.bronze].join("/") : "-";
+			t += " ~~ S " + k + " " + c.code + "." + c.version + " " + c.map + " " + (c.kind === "open" || c.kind === "guided" ? c.kind : "-") +
+				" " + c.checkpoints + " " + c.boxes + " " + (c.urn ? 1 : 0) + " " + word(c.hero) + " " + ti + " " + c.players +
+				" " + word(c.name) + " " + word(c.maker);
+			// the route's line for its postcard (shelf.py line(): 6 base-36 characters a point, 2 to 24 points) in a segment
+			// of its own, which older games' shelf reading skips
+			if (typeof c.line === "string" && /^[0-9a-z]{12,144}$/.test(c.line) && c.line.length % 6 === 0) t += " ~~ SP " + c.code + " " + c.line;
+			if (told[c.code]) return;
+			told[c.code] = 1;
+			if (Array.isArray(c.tags) && c.tags.length <= 24 && c.tags.every(function (g) { return typeof g === "string" && TAG_RE.test(g); }) &&
+				(c.main === "FARM" || c.main === "MOVEMENT") && n(c.souls, 999999))
+				t += " ~~ ST " + c.code + " " + (c.tags.length ? c.tags.map(under).join(",") : "-") + " " + c.main + " " + c.souls +
+					(n(c.week, 9999999) ? " " + c.week : "");   // 3.0: the players this week, an optional fifth field (S's count is all players)
+			var v = c.video;
+			if (v && typeof v.creator === "string" && v.creator.trim() && typeof v.title === "string" && v.title.trim() &&
+				/^(\d{1,2}:)?\d{1,2}:\d\d$/.test(v.time || ""))
+				t += " ~~ SV " + c.code + " " + word(v.creator.slice(0, 32)) + " " + v.time + " " + word(v.title.slice(0, 60));
+			if (c["new"] === true) t += " ~~ SN " + c.code;
+			if (typeof c.ghost_time === "number" && c.ghost_time > 0 && c.ghost_time <= 3600) t += " ~~ SG " + c.code + " " + Math.round(c.ghost_time * 100) / 100;
+		});
+	});
+	return t;
+}
+// The anonymous counts (docs/BOXRUN-MEASUREMENT.md 5.4): the body is rebuilt from these fields alone, in this order, and
+// anything else the game put in is left out. Refused (the job fails) when a field is missing or out of range.
+var COUNT_STEPS = ["load", "menu", "seen", "shot", "press", "go", "ready", "start", "finish", "count", "make", "import", "community", "drop", "lane", "filter"], COUNT_MIN = [0, 1, 2, 5, 10, 30, 60, 1440];
+// COUNT-12 (2.3.4): why the first finish did or didn't count (finish only, optional: older games send none), and how the
+// first run ended without a finish with the checkpoints passed as a bucket's lower edge (drop only, both needed)
+var COUNT_WHY = ["ok", "slow", "boxes", "collect", "hero", "noclip", "skip", "fast"], COUNT_HOW = ["restart", "reset", "route", "left"], COUNT_CP = [0, 1, 2, 5, 10];
+// Route finding (3.0): where a route load came from, as count.py checks it: one of COUNT_FROM, farm:<cell> or move:<tag>.
+// Optional on the load step (left out of other steps, like why); on runs, {source: loads} with at most COUNT_FROM_MAX sources.
+var COUNT_FROM = ["home", "week", "move", "new", "creators", "mine", "star", "tobeat", "filter", "page-tag", "next", "code", "all"];
+var COUNT_FARM = ["hk-yellow", "hk-blue", "hk-green", "am-yellow", "am-blue", "am-green", "jungle", "midboss", "all"];
+var COUNT_MOVE = ["zipline", "wall-jump", "vent", "mantle", "slide", "bridge-buff", "guardian", "healing-bats", "soul-urn"], COUNT_FROM_MAX = 12;
+function countFrom(v) {
+	if (typeof v !== "string") return false;
+	var i = v.indexOf(":");
+	if (i < 0) return COUNT_FROM.indexOf(v) >= 0;
+	var kind = v.slice(0, i), sub = v.slice(i + 1);
+	return kind === "farm" && COUNT_FARM.indexOf(sub) >= 0 || kind === "move" && COUNT_MOVE.indexOf(sub) >= 0;
+}
+var COUNT_KINDS = ["sample", "pack", "community", "own"], COUNT_RUNS = ["start", "finish", "count"], COUNT_CODES = 20, COUNT_MAX = 512;
+var COUNT_PER_CODE = ["started", "finished"];
+function countBody(text) {
+	var d = JSON.parse(text), b = {};
+	var int = function (v, hi) { if (typeof v !== "number" || Math.floor(v) !== v || v < 0 || v > hi) throw new Error("a count out of range"); return v; };
+	var code = function (c) { if (typeof c !== "string" || !/^[0-9A-Z]{6}$/.test(c)) throw new Error("not a short code"); return c; };
+	if (!d || typeof d !== "object" || d.v !== 1) throw new Error("not a count");
+	if (typeof d.app !== "string" || !/^\d{1,3}(\.\d{1,3}){0,2}$/.test(d.app)) throw new Error("bad version");
+	b.v = 1; b.app = d.app; b.e = d.e;
+	if (d.e === "step") {
+		if (COUNT_STEPS.indexOf(d.step) < 0 || COUNT_MIN.indexOf(d.min) < 0) throw new Error("bad step");
+		b.step = d.step; b.age = int(d.age, 400); b.min = d.min;
+		if (d.step === "finish" && d.why !== undefined) { if (COUNT_WHY.indexOf(d.why) < 0) throw new Error("bad why"); b.why = d.why; }
+		if (d.step === "drop") {
+			if (COUNT_HOW.indexOf(d.how) < 0 || COUNT_CP.indexOf(d.cp) < 0) throw new Error("bad drop");
+			b.how = d.how; b.cp = d.cp;
+		}
+		if (d.step === "load" && d.from !== undefined) { if (!countFrom(d.from)) throw new Error("bad from"); b.from = d.from; }
+	} else if (d.e === "day") {
+		b.age = int(d.age, 400); b.wk = int(d.wk, 1);
+		if (d.back !== undefined) { if (d.back !== "d1" && d.back !== "w2") throw new Error("bad back"); b.back = d.back; }
+	} else if (d.e === "runs") {
+		COUNT_RUNS.forEach(function (k) { b[k] = int(d[k], 10000); });
+		if (!d.kinds || typeof d.kinds !== "object") throw new Error("no kinds");
+		b.kinds = {};
+		COUNT_KINDS.forEach(function (k) { b.kinds[k] = int(d.kinds[k], 10000); });
+		var cs = d.codes && typeof d.codes === "object" && !Array.isArray(d.codes) ? Object.keys(d.codes) : null;
+		if (!cs || cs.length > COUNT_CODES || !Array.isArray(d["new"]) || d["new"].length > COUNT_CODES) throw new Error("bad codes");
+		b.codes = {};
+		cs.forEach(function (c) { b.codes[code(c)] = int(d.codes[c], 999); });
+		b["new"] = [];
+		d["new"].forEach(function (c) { if (b["new"].indexOf(code(c)) < 0) b["new"].push(c); });
+		if (d.from !== undefined) {
+			var fs = d.from && typeof d.from === "object" && !Array.isArray(d.from) ? Object.keys(d.from) : null;
+			if (!fs || fs.length > COUNT_FROM_MAX || !fs.every(countFrom)) throw new Error("bad from");
+			b.from = {};
+			fs.forEach(function (k) { b.from[k] = int(d.from[k], 10000); });
+		}
+		// 3.0: runs started and finished per code, for a finish rate (no times); optional, with the limits of codes
+		COUNT_PER_CODE.forEach(function (f) {
+			if (d[f] === undefined) return;
+			var ks = d[f] && typeof d[f] === "object" && !Array.isArray(d[f]) ? Object.keys(d[f]) : null;
+			if (!ks || ks.length > COUNT_CODES) throw new Error("bad " + f);
+			b[f] = {};
+			ks.forEach(function (c) { b[f][code(c)] = int(d[f][c], 999); });
+		});
+	} else throw new Error("unknown count");
+	var out = JSON.stringify(b);
+	if (out.length > COUNT_MAX) throw new Error("too long");
+	return out;
+}
+// One try, never repeated (review L1): a POST whose answer was lost may still have been counted, so trying again could
+// count it twice. The game never waits on a count.
+function countCall(j, body) {
+	var ctl = typeof AbortController === "function" ? new AbortController() : null;
+	var timer = setTimeout(function () { if (ctl) ctl.abort(); }, TIMEOUT);
+	fetch(API + "/count", { method: "POST", headers: { "content-type": "text/plain" }, body: body,
+		signal: ctl ? ctl.signal : undefined, credentials: "omit" })
+		.then(function (r) {
+			clearTimeout(timer);
+			if (r.ok) { done(j, "K"); return; }
+			if (r.status === 404) { fail(j, "not_found the API takes no counts"); return; }
+			return r.text().then(function (t) {
+				var b = null;
+				try { b = JSON.parse(t); } catch (e) { b = null; }
+				fail(j, (b && b.error || "server") + " " + (b && b.message || "the server answered " + r.status));
+			});
+		}, function () { clearTimeout(timer); fail(j, "offline the counts can't be sent"); });
+}
+// the weekly board as " ~~ W" segments (the featured answer and the week job); an odd row is left out, never the answer
+var WEEK_ID = /^\d{4}-\d\d-\d\d(-\d{1,3})?$/, ENTRY = /^[0-9a-f]{12}$/, HERO = /^hero_[a-z0-9_]{1,30}$/;
+function boardText(bd) {
+	if (!bd || typeof bd !== "object") return "";
+	var n = function (v, lo, hi) { return typeof v === "number" && v >= lo && v <= hi && Math.floor(v) === v; };
+	var time = function (v) { return typeof v === "number" && v > 0 && v < 10000 ? String(Math.round(v * 1000) / 1000) : ""; };
+	var word = function (v) { return v ? under(String(v).replace(/[~_\s]+/g, " ").trim()) : "-"; };
+	var t = "", w = bd.week, l = bd.last;
+	if (w && WEEK_ID.test(w.id) && /^BR-[0-9A-Z]{6}$/.test(w.code) && n(w.version, 1, 9999) && n(w.ends, 0, 9999999999) && n(w.entries, 0, 9999999)) {
+		t += " ~~ W " + w.id + " " + w.code + "." + w.version + " " + w.ends + " " + w.entries;
+		if (w.collect === true) t += " ~~ WC";        // a COLLECT week (SAFE-15): its own segment, older brains skip it
+		if (n(w.n, 1, 99999)) t += " ~~ WN " + w.n + " " + (WEEK_ID.test(w.prev || "") ? w.prev : "-");     // FIND-15's WEEK n
+		(Array.isArray(w.fastest) ? w.fastest : []).slice(0, 5).forEach(function (r) {
+			if (r && n(r.place, 1, 9) && ENTRY.test(r.entry) && HERO.test(r.hero) && time(r.time) && r.runner)
+				t += " ~~ WF " + r.place + " " + r.entry + " " + r.hero + " " + time(r.time) + " " + word(r.runner);
+		});
+		(Array.isArray(w.most) ? w.most : []).slice(0, 3).forEach(function (r) {
+			if (r && n(r.place, 1, 9) && ENTRY.test(r.entry) && n(r.runs, 1, 99999) && r.runner)
+				t += " ~~ WM " + r.place + " " + r.entry + " " + r.runs + " " + word(r.runner);
+		});
+		if (typeof w.maker === "string" && w.maker.trim()) t += " ~~ WK " + word(w.maker.slice(0, 32));    // 3.2: the rolled maker
+	} else t += " ~~ W -";
+	if (l && /^BR-[0-9A-Z]{6}$/.test(l.code)) {
+		var f = l.fastest && time(l.fastest.time) && HERO.test(l.fastest.hero) ? l.fastest : null, m = l.most && n(l.most.runs, 1, 99999) ? l.most : null;
+		t += " ~~ WL " + l.code + " " + word(l.name) + " " + (f ? word(f.runner) + " " + time(f.time) + " " + f.hero : "- - -") +
+			" " + (m ? word(m.runner) + " " + m.runs : "- -");
+		// last week's fastest entry while it's kept, for the game's WATCH (its own segment: older brains skip it)
+		if (f && ENTRY.test(f.entry || "")) t += " ~~ WLE " + f.entry;
+		// last week's id and number (FIND-15), so the game can open its page with no week on (older brains skip it)
+		if (WEEK_ID.test(l.id || "") && n(l.n, 1, 99999)) t += " ~~ WLN " + l.id + " " + l.n;
+	}
+	return t;
+}
+// the entries just above and below yours on each list (GET /week with the key; #4 too when you're #6), as " ~~ YF" and " ~~ YM" segments with
+// WF's and WM's checks: an odd row is left out, never the answer. Older brains skip segments they don't know.
+function nearText(nr) {
+	if (!nr || typeof nr !== "object") return "";
+	var n = function (v, lo, hi) { return typeof v === "number" && v >= lo && v <= hi && Math.floor(v) === v; };
+	var time = function (v) { return typeof v === "number" && v > 0 && v < 10000 ? String(Math.round(v * 1000) / 1000) : ""; };
+	var word = function (v) { return v ? under(String(v).replace(/[~_\s]+/g, " ").trim()) : "-"; };
+	var t = "";
+	(Array.isArray(nr.fastest) ? nr.fastest : []).slice(0, 3).forEach(function (r) {
+		if (r && n(r.place, 1, 9999999) && ENTRY.test(r.entry) && HERO.test(r.hero) && time(r.time) && r.runner)
+			t += " ~~ YF " + r.place + " " + r.entry + " " + r.hero + " " + time(r.time) + " " + word(r.runner);
+	});
+	(Array.isArray(nr.most) ? nr.most : []).slice(0, 3).forEach(function (r) {
+		if (r && n(r.place, 1, 9999999) && ENTRY.test(r.entry) && n(r.runs, 1, 99999) && r.runner)
+			t += " ~~ YM " + r.place + " " + r.entry + " " + r.runs + " " + word(r.runner);
+	});
+	return t;
+}
+var WKEY = /^BRW-[0-9A-Z]{26}$/;
+function weekKey(wid) {
+	var k = localStorage.getItem("k:week:" + wid) || "";
+	if (WKEY.test(k)) return k;
+	var v = String(localStorage.getItem("k:week") || "").split("|");       // kept by pages before 11-12, one week only
+	return WKEY.test(v[0]) && v[1] === wid ? v[0] : "";
+}
+function weekKeep(wid, key) {
+	localStorage.setItem("k:week:" + wid, key);
+	localStorage.setItem("k:week", key + "|" + wid);                       // the latest, as older pages kept it
+}
+function weekForget(wid) {
+	localStorage.removeItem("k:week:" + wid);
+	if (String(localStorage.getItem("k:week") || "").split("|")[1] === wid) localStorage.removeItem("k:week");
+}
+// one week's page (wweek): its line, the rows and your entry; rows closed before entry ids were kept have "-"
+function pageText(b, key) {
+	var n = function (v, lo, hi) { return typeof v === "number" && v >= lo && v <= hi && Math.floor(v) === v; };
+	var time = function (v) { return typeof v === "number" && v > 0 && v < 10000 ? String(Math.round(v * 1000) / 1000) : ""; };
+	var word = function (v) { return v ? under(String(v).replace(/[~_\s]+/g, " ").trim()) : "-"; };
+	var wk = function (v) { return WEEK_ID.test(v || "") ? v : "-"; };
+	if (!b || !WEEK_ID.test(b.id) || !n(b.n, 1, 99999) || !/^BR-[0-9A-Z]{6}$/.test(b.code) || !n(b.version, 1, 9999) || !n(b.entries, 0, 9999999))
+		throw new Error("odd answer");
+	var at = b.live ? b.ends : b.ended;
+	var t = "P " + b.id + " " + b.n + " " + wk(b.prev) + " " + wk(b.next) + " " + (b.live ? 1 : 0) + " " + b.code + "." + b.version + " " +
+		(n(at, 0, 9999999999) ? at : 0) + " " + b.entries + " " + (b.collect === true ? 1 : 0) + " " + word(b.name);
+	(Array.isArray(b.fastest) ? b.fastest : []).slice(0, 5).forEach(function (r) {
+		if (r && n(r.place, 1, 9) && (r.entry === undefined || ENTRY.test(r.entry)) && HERO.test(r.hero) && time(r.time) && r.runner)
+			t += " ~~ PF " + r.place + " " + (r.entry || "-") + " " + r.hero + " " + time(r.time) + " " + word(r.runner);
+	});
+	(Array.isArray(b.most) ? b.most : []).slice(0, 3).forEach(function (r) {
+		if (r && n(r.place, 1, 9) && (r.entry === undefined || ENTRY.test(r.entry)) && n(r.runs, 1, 99999) && r.runner)
+			t += " ~~ PM " + r.place + " " + (r.entry || "-") + " " + r.runs + " " + word(r.runner);
+	});
+	if (typeof b.maker === "string" && b.maker.trim()) t += " ~~ PK " + word(b.maker.slice(0, 32));       // 3.2: the rolled maker
+	var y = key && b.you;
+	if (y && ENTRY.test(y.entry) && time(y.time))
+		t += " ~~ PY " + y.entry + " " + y.time + " " + y.runs + " " + place(y.place) + " " + place(y.runs_place) + " " + (y.of || 0) + " " +
+			(y.status === "ok" ? "ok" : "held") + " " + under(y.runner);
+	return t;
+}
+function place(v) { return typeof v === "number" && v > 0 ? String(v) : "-"; }
+function weekJob(j, verb, args) {
+	var wid = args[verb === "wsend" ? 1 : 0] || "";
+	if (verb === "wghost" || verb === "wrep") {
+		if (!ENTRY.test(wid)) return fail(j, "bad_request not a board entry");
+		if (verb === "wrep") return call(j, "POST", "/week/entries/" + wid + "/report", JSON.stringify({ reason: args[1] || "other" }), null,
+			function () { return "K"; });
+		if (args[1] && !WEEK_ID.test(args[1])) return fail(j, "bad_request not a week");
+		return call(j, "GET", "/week/entries/" + wid + "/ghost" + (args[1] ? "?week=" + args[1] : ""), null, null, function (b) {
+			if (b.path && !/^BRGP1\.[A-Za-z0-9._]+=*$/.test(b.path)) throw new Error("odd path");
+			return "G " + (b.code || "-") + "." + b.version + " " + b.hero + " " + b.souls + " " + b.time + " " + under(b.runner) + " " +
+				(b.step || 0) + " " + (b.spot || 0) + " " + b.botrec + (b.path ? " " + b.path : "");
+		});
+	}
+	if (!WEEK_ID.test(wid)) return fail(j, "bad_request not a week");
+	var key = weekKey(wid);
+	if (verb === "wweek") return call(j, "GET", "/weeks/" + wid, null, key || null, function (b) { return pageText(b, key); });
+	if (verb === "week") {
+		if (!key) return done(j, "Y -");
+		return call(j, "GET", "/week", null, key, function (b) {
+			var y = b.you;
+			if (y && !ENTRY.test(y.entry)) throw new Error("odd answer");
+			return (y ? "Y " + y.entry + " " + y.time + " " + y.runs + " " + place(y.place) + " " + place(y.runs_place) + " " + (y.of || 0) + " " +
+				(y.status === "ok" ? "ok" : "held") + " " + under(y.runner) : "Y -") + boardText(b) + nearText(y && y.near);
+		});
+	}
+	if (verb === "wdrop") {
+		if (!key) return fail(j, "not_found You have no time on this week's board.");
+		return call(j, "POST", "/week/withdraw?week=" + wid, null, key, function () { weekForget(wid); return "K"; });
+	}
+	if (verb !== "wsend") return fail(j, "bad_request unknown request " + verb);
+	var body = j.staged.join("");
+	if (!body) return fail(j, "bad_request nothing was staged");
+	return call(j, "POST", "/week/entry", body, key || null, function (b) {
+		if (!ENTRY.test(b.entry) || !WEEK_ID.test(b.week) || (b.key && !/^BRW-[0-9A-Z]{26}$/.test(b.key))) throw new Error("odd answer");
+		if (b.key) weekKeep(b.week, b.key);                                 // kept before the game hears of it
+		var kept = args[2] === "2" && b.name_kept === true && typeof b.name_from === "number" && b.name_from > 0 && b.runner ?
+			" ~~ EN " + Math.floor(b.name_from) + " " + under(String(b.runner).replace(/[~_\s]+/g, " ").trim()) : "";
+		return "E " + b.entry + " " + b.time + " " + b.runs + " " + (b.best ? 1 : 0) + " " + place(b.place) + " " + place(b.runs_place) +
+			" " + (b.of || 0) + " " + b.week + kept;
+	});
+}
+function start(j, verb, args) {
+	var code = args[0] || "";
+	if (/^(week|wsend|wdrop|wghost|wrep|wweek)$/.test(verb)) {
+		if (verb === "wsend" && /^[a-z0-9-]{8,64}$/.test(args[0] || "")) j.idem = args[0];
+		return weekJob(j, verb, args);
+	}
+	if (verb === "count") {
+		var body;
+		try { body = countBody(args.join(":")); } catch (e) { return fail(j, "bad_request " + e.message); }
+		return countCall(j, body);
+	}
+	if (verb === "featured") return call(j, "GET", "/featured" + (args[0] === "0" ? "?count=0" : ""), null, null, function (b) {
+		var t = "F -";
+		if (b.code) {
+			if (!/^BR-[0-9A-Z]{6}$/.test(b.code) || !(b.version > 0)) throw new Error("odd answer");
+			t = "F " + b.code + "." + b.version + " " + under(b.name);
+		}
+		if (b.latest && /^\d{1,3}(\.\d{1,3}){0,2}$/.test(b.latest)) t += " ~~ V " + b.latest;
+		if (b.notice) t += " ~~ M " + under(String(b.notice).replace(/~/g, ""));
+		if (b.codes === "off") t += " ~~ O";
+		if (b.ag === "off") t += " ~~ AG 0";
+		if (b.shelf) t += " ~~ L" + shelfText(b.shelf);
+		if (b.board) t += boardText(b.board);
+		return t;
+	});
+	// the game's own idempotency key, one per route and what's sent (net:<job>:pub:<key>, net:<job>:upd:<code>:<key>):
+	// a publish asked again in a later job (its answer came after the game gave up) gets the first answer back, the
+	// same code and edit key, never a second route. Without one (older games) the job's own key is used.
+	var idem = verb === "pub" ? args[0] : verb === "upd" ? args[1] : "";
+	if (idem && /^[a-z0-9-]{8,64}$/.test(idem)) j.idem = idem;       // the API takes 8-64 characters
+	if (verb !== "pub" && !codeOk(code)) return fail(j, "bad_code not a BoxRun short code");
+	var path = "/routes/" + encodeURIComponent(code);
+	if (verb === "fetch") return call(j, "GET", path, null, null, function (b) {
+		var t = "R " + b.code + "." + b.version + " " + b.latest + " " + b.sum + " " + b.br1;
+		if (b.ghost) t += " ~~ G " + b.ghost.hero + " " + b.ghost.souls + " " + b.ghost.time + " " + b.ghost.chars + " " + under(b.ghost.runner);
+		if (typeof b.players === "number") t += " ~~ N " + b.players;
+		if (typeof b.listed === "boolean") t += " ~~ T " + (b.listed ? 1 : 0);
+		return t;
+	});
+	if (verb === "ghost") return call(j, "GET", path + "/ghost", null, null, function (b) {
+		if (b.path && !/^BRGP1\.[A-Za-z0-9._]+=*$/.test(b.path)) throw new Error("odd path");
+		return "G " + b.code + "." + b.version + " " + b.hero + " " + b.souls + " " + b.time + " " + under(b.runner) + " " +
+			(b.step || 0) + " " + (b.spot || 0) + " " + b.botrec + (b.path ? " " + b.path : "");
+	});
+	if (verb === "report") return call(j, "POST", path + "/report", JSON.stringify({ reason: args[1] || "other" }), null,
+		function () { return "K"; });
+	if (verb === "list") {
+		var lk = localStorage.getItem("k:" + code6(code).toLowerCase());
+		if (args[1] !== "1" && args[1] !== "0") return fail(j, "bad_request list takes 1 or 0");
+		if (!lk) return fail(j, "no_key this PC has no edit key for " + code);
+		return call(j, "POST", path + "/listing", JSON.stringify({ listed: args[1] === "1" }), lk, function (b) {
+			if (!/^BR-[0-9A-Z]{6}$/.test(b.code) || typeof b.listed !== "boolean") throw new Error("odd answer");
+			return "T " + b.code + " " + (b.listed ? 1 : 0);
+		});
+	}
+	if (verb === "mstats") {
+		var mk = localStorage.getItem("k:" + code6(code).toLowerCase());
+		if (!mk) return fail(j, "no_key this PC has no edit key for " + code);
+		return call(j, "GET", "/routes/" + code6(code) + "/stats", null, mk, function (b) {
+			var c = function (v) { return typeof v === "number" && v >= 0 && v <= 99999999 && Math.floor(v) === v; };
+			// the week's started and finished counts are null until they cover 7 full days (3.2 hand test 1): "-"
+			if (!/^BR-[0-9A-Z]{6}$/.test(b.code) || !["players_week", "players", "runners"].every(function (k) { return c(b[k]); }) ||
+				!["started_week", "finished_week"].every(function (k) { return b[k] === null || c(b[k]); }))
+				throw new Error("odd answer");
+			var rate = typeof b.finish_rate === "number" && b.finish_rate >= 0 && b.finish_rate <= 1 ? String(Math.round(b.finish_rate * 1000) / 1000) : "-";
+			return "MS " + b.code + " " + b.players_week + " " + b.players + " " + b.runners + " " + (b.started_week === null ? "-" : b.started_week) + " " + (b.finished_week === null ? "-" : b.finished_week) + " " + rate;
+		});
+	}
+	var body = j.staged.join("");
+	if (!body) return fail(j, "bad_request nothing was staged");
+	// the maker's tags (route finding, 11-18): {"tags": [...], "main": ...} with this PC's edit key; META only on the API
+	if (verb === "tags") {
+		var tk = localStorage.getItem("k:" + code6(code).toLowerCase());
+		if (!tk) return fail(j, "no_key this PC has no edit key for " + code);
+		return call(j, "PUT", path + "/tags", body, tk, function (b) {
+			if (!/^BR-[0-9A-Z]{6}$/.test(b.code) || !Array.isArray(b.tags)) throw new Error("odd answer");
+			return "TG " + b.code + " " + (b.tags.length ? b.tags.map(under).join(",") : "-") + " " + (b.main || "-");
+		});
+	}
+	if (verb === "pub") return call(j, "POST", "/routes", body, null, function (b) {
+		if (!/^BR-[0-9A-Z]{6}$/.test(b.code) || !/^BRK-[0-9A-Z]{26}$/.test(b.edit_key)) throw new Error("odd answer");
+		localStorage.setItem("k:" + code6(b.code).toLowerCase(), b.edit_key);   // kept before the game hears of it
+		return "P " + b.code + " " + b.version + " " + b.sum;
+	});
+	if (verb === "upd") {
+		var key = localStorage.getItem("k:" + code6(code).toLowerCase());
+		if (!key) return fail(j, "no_key this PC has no edit key for " + code);
+		return call(j, "POST", path + "/versions", body, key, function (b) { return "P " + b.code + " " + b.version + " " + b.sum; });
+	}
+	fail(j, "bad_request unknown request " + verb);
+}
+// One API call with retries: the network failing, a timeout, a 5xx, a 409 (busy) or the whole-API throttle is tried again, up to
+// TRIES times; anything else is the answer. pub and upd send an Idempotency-Key, so a retry can't publish twice.
+function call(j, method, path, body, key, ok, tries) {
+	tries = (tries || 0) + 1;
+	var headers = {}, ctl = typeof AbortController === "function" ? new AbortController() : null;
+	if (body !== null) headers["content-type"] = "application/json";
+	if (key) headers["authorization"] = "Bearer " + key;
+	if (method === "POST" && !/report$/.test(path)) headers["idempotency-key"] = j.idem;
+	var timer = setTimeout(function () { if (ctl) ctl.abort(); }, TIMEOUT);
+	function again(error) {
+		if (tries < TRIES) setTimeout(function () { call(j, method, path, body, key, ok, tries); }, 1000 * tries * tries);
+		else fail(j, error);
+	}
+	fetch(API + path, { method: method, headers: headers, body: body === null ? undefined : body,
+		signal: ctl ? ctl.signal : undefined, credentials: "omit" })
+		.then(function (r) {
+			clearTimeout(timer);
+			return r.text().then(function (t) {
+				var b = null;
+				try { b = JSON.parse(t); } catch (e) { b = null; }
+				// a 429 without our error code is API Gateway's whole-API throttle (a launch-day rush): wait and retry
+				// (the weekly board's 409s are answers: no week on, or another route's week)
+				var busy = r.status === 409 && !(b && /^(no_week|not_this_week)$/.test(b.error));
+				if (r.status >= 500 || busy || (r.status === 429 && !(b && b.error))) return again((b && b.error || "server") + " " + (b && b.message || "the server had a problem"));
+				if (!r.ok || !b) return fail(j, (b && b.error || "server") + " " + (b && b.message || "odd answer from the server") +
+					(r.status === 429 ? " (" + (r.headers.get("retry-after") || "60") + " s)" : ""));
+				// a write the answer needs that doesn't fit (pub's edit key; 3.2.1 r1, review finding 16): "full", so the game makes
+				// room and asks the same publish again, which the API answers with the same code and key (its idempotency key)
+				try { done(j, ok(b)); } catch (e) { fail(j, isFull(e) ? "full The save space is full. Delete routes you don't play, then SHARE again." : "server odd answer from the server"); }
+			});
+		}, function () { clearTimeout(timer); again("offline the online library can't be reached"); });
+}
+
+function handle() {
+	var h = location.hash.slice(1), at = h.indexOf(":");
+	if (at < 0) return;
+	var seq = h.slice(0, at), reply;
+	try { reply = answer(decodeURIComponent(h.slice(at + 1))); } catch (e) { reply = isFull(e) ? "full" : "err " + e; }
+	document.title = "BRS " + seq + " " + reply;
+}
+window.addEventListener("hashchange", handle);
+handle();
+</script>
