@@ -1,1 +1,1 @@
-hold=0 ns=w885n pad=3000
+hold=0 clear=w885n
