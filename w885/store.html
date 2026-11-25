@@ -1,0 +1,22 @@
+<!doctype html>
+<meta charset="utf-8">
+<title>BRS hold</title>
+<script>
+// TEST ONLY (BoxRun 3.2.1 candidate 3 pass, w885, 2026-11-24): a loader for BoxRun's save page on the staging origin.
+// It runs page.html (3.2.1's api/client/store.html, unchanged) on this origin's own localStorage (the staging store, no
+// prefix), unless cfg.txt says hold=1: then it answers nothing (as a page that hasn't loaded) and reads cfg.txt again
+// every 3 s, running the page as soon as it says hold=0. Lets a test hold the save page back and let it answer later.
+// Never on save.boxrun.gg.
+(function () {
+	function get(u) { var x = new XMLHttpRequest(); x.open("GET", u + "?t=" + Date.now(), false); x.send(); if (x.status !== 200) throw new Error(u + " " + x.status); return x.responseText; }
+	function held() { try { return /(^|\s)hold=1(\s|$)/.test(get("cfg.txt")); } catch (e) { return true; } }
+	function run() {
+		var html = get("page.html");
+		var js = html.slice(html.indexOf("<script>") + 8, html.lastIndexOf("<\/script>"));
+		document.title = "BRS ready";
+		new Function(js)();
+	}
+	function wait() { if (held()) setTimeout(wait, 3000); else run(); }
+	wait();
+})();
+</script>
