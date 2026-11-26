@@ -1,1 +1,1 @@
-hold=0 ns=w889j
+hold=0 clear=w889j
