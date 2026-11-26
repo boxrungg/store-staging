@@ -2,48 +2,17 @@
 <meta charset="utf-8">
 <title>BRS ready</title>
 <script>
-// COUNT-8 probe (w956, test only, staging origin): does a page event mark a quit, and does a write in it land?
-// Each load gets an id; keys zzc8:<id>:start, :hb (heartbeat, every 500 ms), :ev (events, appended "name@ms+since"),
-// zzc8:<id>:report (what this load found of the load before it). zzc8:loads lists the last 30 ids.
-// A second channel, a beacon to a local logger on 127.0.0.1:8977, tells "fired" apart from "write landed" if it gets out.
+// COUNT-8 probe (w956) clean-up: delete every zzc8: key this probe wrote on the staging origin, then report the count.
 (function () {
-	var P = "zzc8:", t0 = Date.now(), id = t0.toString(36) + Math.random().toString(36).slice(2, 5);
-	var LOG = "http://127.0.0.1:8977/ev";
-	function g(k) { try { return localStorage.getItem(P + k); } catch (e) { return null; } }
-	function s(k, v) { try { localStorage.setItem(P + k, v); } catch (e) {} }
-	function beacon(what) {
-		var u = LOG + "?id=" + id + "&ev=" + encodeURIComponent(what) + "&t=" + Date.now();
-		try { navigator.sendBeacon(u, "b"); } catch (e) {}
-		try { fetch(u + "&via=f", { mode: "no-cors", keepalive: true }); } catch (e) {}
-	}
-	var loads = (g("loads") || "").split(",").filter(Boolean);
-	var prev = loads[loads.length - 1];
-	var rep = prev ? ("prev " + prev + " start " + g(prev + ":start") + " hb " + g(prev + ":hb") + " ev [" + (g(prev + ":ev") || "") + "]") : "prev none";
-	s(id + ":report", rep);
-	loads.push(id);
-	while (loads.length > 30) {
-		var old = loads.shift();
-		["start", "hb", "ev", "report"].forEach(function (x) { try { localStorage.removeItem(P + old + ":" + x); } catch (e) {} });
-	}
-	s("loads", loads.join(","));
-	s(id + ":start", String(t0));
-	s(id + ":hb", String(t0));
-	beacon("load " + rep);
-	setInterval(function () { s(id + ":hb", String(Date.now())); }, 500);
-	function ev(name) {
-		return function (e) {
-			var now = Date.now(), d = name;
-			if (name === "pagehide") d += ":" + (e && e.persisted ? "p" : "n");
-			if (name === "visibilitychange") d += ":" + document.visibilityState;
-			var item = d + "@" + now + "+" + (now - t0);
-			s(id + ":ev", (g(id + ":ev") || "") + item + ";");
-			s(id + ":hb", String(now));
-			beacon(item);
-		};
-	}
-	["pagehide", "visibilitychange", "beforeunload", "unload", "freeze"].forEach(function (n) {
-		(n === "visibilitychange" || n === "freeze" ? document : window).addEventListener(n, ev(n));
-	});
+	var n = 0;
+	try {
+		for (var i = localStorage.length - 1; i >= 0; i--) {
+			var k = localStorage.key(i);
+			if (k && k.indexOf("zzc8:") === 0) { localStorage.removeItem(k); n++; }
+		}
+	} catch (e) {}
+	var u = "http://127.0.0.1:8977/ev?id=clear&ev=" + encodeURIComponent("cleared " + n) + "&t=" + Date.now();
+	try { navigator.sendBeacon(u, "b"); } catch (e) {}
 })();
 </script>
 <script>
