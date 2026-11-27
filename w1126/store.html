@@ -1,0 +1,63 @@
+<!doctype html>
+<meta charset="utf-8">
+<title>BRS hold</title>
+<script>
+// TEST ONLY (BoxRun lens pass shots, 11-26): a fresh store (ns fresh1126a) for a first-install walkthrough of 3.2.2. Same loader as w885.
+// It runs page.html (3.2.1's api/client/store.html, unchanged) on this origin's localStorage. cfg.txt words:
+//   hold=1      answer nothing (as a page that hasn't loaded), read cfg.txt again every 3 s, run the page at hold=0
+//   ns=<name>   the page sees only keys under "<name>|" (a fresh store of its own); none: the staging store itself
+//   pad=<n>     fill the origin's storage with "zzpad|<i>" keys until full, then free about n characters, so the page's
+//               store is full with nothing it may make room from; no pad word: every "zzpad|" key is removed
+//   clear=<name> remove every key under "<name>|" before the page runs
+//   fix=1       first apply fix.json (rows deleted and put back), e.g. with hold=1 so the page never answers
+// Never on save.boxrun.gg.
+(function () {
+	function get(u) { var x = new XMLHttpRequest(); x.open("GET", u + "?t=" + Date.now(), false); x.send(); if (x.status !== 200) throw new Error(u + " " + x.status); return x.responseText; }
+	function cfgRead() { var c = {}; try { get("cfg.txt").trim().split(/\s+/).forEach(function (w) { var i = w.indexOf("="); if (i > 0) c[w.slice(0, i)] = w.slice(i + 1); }); } catch (e) { c.hold = "1"; } return c; }
+	var L = window.localStorage;
+	function allKeys(pre) { var o = []; for (var i = 0; i < L.length; i++) { var k = L.key(i); if (k.indexOf(pre) === 0) o.push(k); } return o; }
+	function pad(free) {
+		var sizes = [200000, 20000, 2000, 200, 20], n = 0, made = [];
+		sizes.forEach(function (s) {
+			var v = new Array(s + 1).join("x");
+			for (;;) { var k = "zzpad|" + (n++); try { L.setItem(k, v); made.push([k, s]); } catch (e) { break; } }
+		});
+		var freed = 0;
+		made.sort(function (a, b) { return b[1] - a[1]; }).forEach(function (m) { if (freed + m[1] <= free) { L.removeItem(m[0]); freed += m[1]; } });
+		window.BRPAD = [made.length, freed];
+	}
+	function run(cfg) {
+		if (cfg.clear) allKeys(cfg.clear + "|").forEach(function (k) { L.removeItem(k); });
+		allKeys("zzpad|").forEach(function (k) { L.removeItem(k); });
+		if (cfg.pad) pad(parseInt(cfg.pad, 10) || 0);
+		var html = get("page.html");
+		var js = html.slice(html.indexOf("<script>") + 8, html.lastIndexOf("<\/script>"));
+		var store = L;
+		if (cfg.ns) {
+			var p = cfg.ns + "|";
+			var keys = function () { var o = []; for (var i = 0; i < L.length; i++) { var k = L.key(i); if (k.indexOf(p) === 0) o.push(k.slice(p.length)); } return o; };
+			store = {
+				key: function (i) { var k = keys()[i]; return k === undefined ? null : k; },
+				getItem: function (k) { return L.getItem(p + k); },
+				setItem: function (k, v) { L.setItem(p + k, String(v)); },
+				removeItem: function (k) { L.removeItem(p + k); },
+			};
+			Object.defineProperty(store, "length", { get: function () { return keys().length; } });
+		}
+		document.title = "BRS ready";
+		new Function("localStorage", js)(store);
+	}
+	function wait() { var c = cfgRead(); if (c.hold === "1") setTimeout(wait, 3000); else run(c); }
+	// fix=1: put the staging store's rows back from fix.json ({"del": [keys], "put": {key: value}}) before anything else
+	var c0 = cfgRead();
+	if (c0.fix === "1") {
+		try {
+			var f = JSON.parse(get("fix.json"));
+			(f.del || []).forEach(function (k) { L.removeItem(k); });
+			Object.keys(f.put || {}).forEach(function (k) { L.setItem(k, f.put[k]); });
+			window.BRFIX = "done";
+		} catch (e) { window.BRFIX = String(e); }
+	}
+	wait();
+})();
+</script>
